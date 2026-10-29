@@ -13,12 +13,23 @@ export interface WindowProject {
   name: string;
 }
 
-export const useWindowProjects = create<{ projects: WindowProject[]; busy: boolean }>(() => ({
+export const useWindowProjects = create<{ projects: WindowProject[]; busy: boolean; collapsed: boolean }>(() => ({
   projects: [],
   busy: false,
+  collapsed: false,
 }));
 
 let storageKey = "openidea.window.projects:main";
+
+/** Layout belongs to this window and is independent of its active project. */
+export function setWindowProjectsCollapsed(collapsed: boolean) {
+  useWindowProjects.setState({ collapsed });
+  try {
+    localStorage.setItem(`${storageKey}:collapsed`, String(collapsed));
+  } catch {
+    // Layout changes still work if webview storage is unavailable.
+  }
+}
 
 /** Match native Windows paths without creating duplicate entries for slash or case differences. */
 export function projectPathKey(path: string): string {
@@ -51,6 +62,12 @@ export function attachWindowProjects(paths: readonly string[]) {
 export function trackWindowProjects(label = isTauri() ? getCurrentWindow().label : "main"): () => void {
   storageKey = `openidea.window.projects:${label}`;
   let projects: WindowProject[] = [];
+  let collapsed = false;
+  try {
+    collapsed = localStorage.getItem(`${storageKey}:collapsed`) === "true";
+  } catch {
+    // Use the expanded layout if storage is unavailable.
+  }
   try {
     const value: unknown = JSON.parse(localStorage.getItem(storageKey) ?? "[]");
     if (Array.isArray(value)) {
@@ -62,7 +79,7 @@ export function trackWindowProjects(label = isTauri() ? getCurrentWindow().label
   } catch {
     // A damaged list must not prevent startup.
   }
-  useWindowProjects.setState({ projects, busy: false });
+  useWindowProjects.setState({ projects, busy: false, collapsed });
   const record = () => {
     const project = useProject.getState().project;
     if (!project || isRemoteWindow()) return;

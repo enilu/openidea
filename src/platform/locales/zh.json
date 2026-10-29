@@ -1,5 +1,7 @@
 {
   "windowProjects.title": "本窗口项目",
+  "windowProjects.collapse": "收起项目侧栏",
+  "windowProjects.expand": "展开项目侧栏",
   "windowProjects.hint": "同一时刻只打开一个项目",
   "windowProjects.add": "添加项目…",
   "windowProjects.empty": "添加本地文件夹，将项目保留在此窗口中。添加时不会打开项目。",

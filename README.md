@@ -59,6 +59,9 @@ Rust 1.96, Node 22.19 or newer, pnpm and the [Tauri prerequisites](https://v2.ta
 The **Window Projects** sidebar keeps a persistent list of local projects for each window.
 Use **Add Projects…** to add folders without opening them. Click a project to open it in
 the current window; the previous project closes first, with a prompt for unsaved files.
+The arrow in the sidebar header collapses it to a narrow project-icon rail; click the
+arrow again to expand it. Hover a project icon to see its name, path and open/closed
+status, or click it to switch projects. Each window remembers its sidebar layout.
 Only the active project runs its project services. Editor tabs and caret positions are
 restored through the existing per-project editor sessions.
 

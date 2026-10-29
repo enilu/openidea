@@ -45,6 +45,7 @@ import {
   closeWindowProject,
   projectPathKey,
   removeWindowProject,
+  setWindowProjectsCollapsed,
   trackWindowProjects,
   useWindowProjects,
 } from "./windowProjectList";
@@ -253,6 +254,61 @@ describe("single active project", () => {
 });
 
 describe("window project sidebar", () => {
+  it("remembers the layout independently for each window", () => {
+    expect(useWindowProjects.getState().collapsed).toBe(false);
+    setWindowProjectsCollapsed(true);
+    off();
+    off = trackWindowProjects("project-1");
+    expect(useWindowProjects.getState().collapsed).toBe(false);
+    off();
+    off = trackWindowProjects("main");
+    expect(useWindowProjects.getState().collapsed).toBe(true);
+    setWindowProjectsCollapsed(false);
+    off();
+    off = trackWindowProjects("main");
+    expect(useWindowProjects.getState().collapsed).toBe(false);
+  });
+
+  it("collapses without closing the project and expands to restore the controls", () => {
+    attachWindowProjects(["/p/api", "/p/web"]);
+    useProject.setState({ project: project("/p/api") });
+    render(<WindowProjects />);
+    const toggle = screen.getByRole("button", { name: "Collapse project sidebar" });
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(toggle);
+    expect(screen.getByRole("button", { name: "Expand project sidebar" })).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("/p/api")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Close project" })).toBeNull();
+    expect(screen.getByRole("button", { name: "api — Open" })).toHaveAttribute("aria-current", "true");
+    expect(screen.getByRole("button", { name: "web — Closed" })).toHaveAttribute("title", "web\n/p/web\nClosed");
+    expect(calls).toEqual([]);
+    fireEvent.click(screen.getByRole("button", { name: "Expand project sidebar" }));
+    expect(screen.getByText("/p/api")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Close project" })).toBeTruthy();
+    expect(useProject.getState().project?.root).toBe("/p/api");
+  });
+
+  it("can switch projects from the collapsed rail while keeping it collapsed", async () => {
+    attachWindowProjects(["/p/api", "/p/web"]);
+    useProject.setState({ project: project("/p/api") });
+    setWindowProjectsCollapsed(true);
+    render(<WindowProjects />);
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "web — Closed" })));
+    expect(calls).toEqual(["close", "open:/p/web"]);
+    expect(useWindowProjects.getState().collapsed).toBe(true);
+    expect(screen.getByRole("button", { name: "web — Open" })).toHaveAttribute("aria-current", "true");
+  });
+
+  it("keeps the expand button usable for an empty collapsed list and while busy", () => {
+    useWindowProjects.setState({ busy: true, collapsed: true });
+    render(<WindowProjects />);
+    const expand = screen.getByRole("button", { name: "Expand project sidebar" });
+    expect(expand).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Add Projects…" })).toBeDisabled();
+    fireEvent.click(expand);
+    expect(screen.getByText(/Add local folders/)).toBeTruthy();
+  });
+
   it("shows one active entry, switches in place, and keeps the sidebar when all projects close", async () => {
     attachWindowProjects(["/p/api", "/p/web"]);
     useProject.setState({ project: project("/p/api") });
