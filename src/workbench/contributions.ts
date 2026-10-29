@@ -281,6 +281,8 @@ interface WorkbenchSlots {
   welcome?: ComponentType;
   /** The title bar project widget's popup (open / recent projects). */
   projectPopup?: ComponentType<ProjectPopupProps>;
+  /** Persistent list of projects attached to this window. */
+  projectSidebar?: ComponentType;
 }
 
 export interface ProjectPopupProps {
@@ -299,6 +301,7 @@ function provideSlot<K extends keyof WorkbenchSlots>(slot: K, component: NonNull
 
 export const provideEditorArea = (component: ComponentType) => provideSlot("editorArea", component);
 export const provideWelcomeView = (component: ComponentType) => provideSlot("welcome", component);
+export const provideProjectSidebar = (component: ComponentType) => provideSlot("projectSidebar", component);
 export const provideProjectPopup = (component: ComponentType<ProjectPopupProps>) =>
   provideSlot("projectPopup", component);
 

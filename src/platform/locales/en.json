@@ -1,4 +1,13 @@
 {
+  "windowProjects.title": "Window Projects",
+  "windowProjects.hint": "One project open at a time",
+  "windowProjects.add": "Add Projects…",
+  "windowProjects.empty": "Add local folders to keep them in this window. Adding a folder does not open it.",
+  "windowProjects.open": "Open",
+  "windowProjects.closed": "Closed",
+  "windowProjects.close": "Close project",
+  "windowProjects.remove": "Remove from this window (keep files)",
+  "windowProjects.failed": "Could not update window projects",
   "app.about.build": "Build",
   "app.about.configDir": "Configuration",
   "app.about.copyInfo": "Copy Info",

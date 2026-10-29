@@ -1,6 +1,13 @@
 /** Welcome screen, recent projects (File › Open Recent) and reopening the last project on startup. */
 import { registerActions } from "@/platform/actions";
-import { provideProjectPopup, provideWelcomeView, registerOverlay } from "@/workbench/contributions";
+import {
+  provideProjectPopup,
+  provideProjectSidebar,
+  provideWelcomeView,
+  registerOverlay,
+} from "@/workbench/contributions";
+import { WindowProjects } from "./WindowProjects";
+import { trackWindowProjects } from "./windowProjectList";
 import { ProjectPopup } from "./ProjectPopup";
 import { RecentProjectsPopup, showRecentProjectsPopup } from "./RecentProjectsPopup";
 import { reopenLastProject, trackSession } from "./session";
@@ -8,6 +15,8 @@ import { WelcomeView } from "./WelcomeView";
 
 export function activate(): () => void {
   const disposers = [
+    trackWindowProjects(),
+    provideProjectSidebar(WindowProjects),
     trackSession(),
     provideWelcomeView(WelcomeView),
     provideProjectPopup(ProjectPopup),

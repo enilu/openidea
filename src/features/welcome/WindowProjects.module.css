@@ -1,0 +1,99 @@
+.sidebar {
+  width: 224px;
+  flex: 0 0 224px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 8px;
+  border-right: 1px solid var(--border);
+  background: var(--bg-island);
+}
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-left: 8px;
+}
+.header h2 {
+  margin: 0;
+  font-size: var(--fs-ui);
+  font-weight: 600;
+}
+.hint,
+.empty {
+  margin: 0;
+  padding: 0 8px;
+  color: var(--fg-muted);
+  font-size: var(--fs-small);
+}
+.list {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.project {
+  display: flex;
+  align-items: flex-start;
+  margin-bottom: 4px;
+  border-radius: var(--radius-selection, 5px);
+}
+.active {
+  background: var(--bg-tree-selected);
+}
+.open {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  padding: 10px 6px 10px 8px;
+  border: 0;
+  border-radius: inherit;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.open:disabled {
+  cursor: default;
+}
+.open:hover:not(:disabled) {
+  background: var(--bg-button);
+}
+.open:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+.details {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.name,
+.path {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.name {
+  font-weight: 500;
+}
+.path,
+.status {
+  color: var(--fg-muted);
+  font-size: var(--fs-small);
+}
+.active .status {
+  color: var(--accent);
+}
+.actions {
+  display: flex;
+  flex-direction: column;
+  padding-top: 5px;
+}

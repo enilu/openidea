@@ -52,7 +52,21 @@ pnpm install
 pnpm tauri dev
 ```
 
-Rust 1.96, Node 22, pnpm and the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/).
+Rust 1.96, Node 22.19 or newer, pnpm and the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/).
+
+## Window projects
+
+The **Window Projects** sidebar keeps a persistent list of local projects for each window.
+Use **Add Projects…** to add folders without opening them. Click a project to open it in
+the current window; the previous project closes first, with a prompt for unsaved files.
+Only the active project runs its project services. Editor tabs and caret positions are
+restored through the existing per-project editor sessions.
+
+**Close project** keeps its entry in the list. **Remove from this window** removes only
+the entry and never deletes files. Closed entries survive project switches and app restarts.
+If a folder is missing or unreadable, opening it leaves the current project unchanged.
+If loading fails after closing the previous project, both entries remain in the list and
+the window has no active project; either project can be opened again from the sidebar.
 
 ## License
 

@@ -1,4 +1,13 @@
 {
+  "windowProjects.title": "本窗口项目",
+  "windowProjects.hint": "同一时刻只打开一个项目",
+  "windowProjects.add": "添加项目…",
+  "windowProjects.empty": "添加本地文件夹，将项目保留在此窗口中。添加时不会打开项目。",
+  "windowProjects.open": "已打开",
+  "windowProjects.closed": "已关闭",
+  "windowProjects.close": "关闭项目",
+  "windowProjects.remove": "从本窗口移除（保留文件）",
+  "windowProjects.failed": "无法更新窗口项目",
   "app.about.build": "构建",
   "app.about.configDir": "配置目录",
   "app.about.copyInfo": "复制信息",

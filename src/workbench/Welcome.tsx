@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { executeAction } from "@/platform/actions";
 import { shortcutLabel } from "@/platform/keymap";
 import { useProject } from "@/platform/project";
@@ -50,20 +50,23 @@ function WelcomeFallback() {
 }
 
 /** Shown while no project is open; a feature can replace the content via `provideWelcomeView`. */
-export function Welcome() {
+export function Welcome({ sidebar }: { sidebar?: ReactNode }) {
   const Provided = useWorkbenchSlots((s) => s.welcome);
   return (
     <div className={styles.root}>
       <TitleBar minimal title="Welcome to OpenIDEA" />
-      <main className={styles.main}>
-        {Provided ? (
-          <ErrorBoundary name="welcome view" fallback={<WelcomeFallback />}>
-            <Slot component={Provided} />
-          </ErrorBoundary>
-        ) : (
-          <WelcomeFallback />
-        )}
-      </main>
+      <div className={styles.body}>
+        {sidebar}
+        <main className={styles.main}>
+          {Provided ? (
+            <ErrorBoundary name="welcome view" fallback={<WelcomeFallback />}>
+              <Slot component={Provided} />
+            </ErrorBoundary>
+          ) : (
+            <WelcomeFallback />
+          )}
+        </main>
+      </div>
     </div>
   );
 }
