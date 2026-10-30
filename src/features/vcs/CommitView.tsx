@@ -15,6 +15,7 @@ import {
   IconButton,
   List,
   Menu,
+  Select,
   SplitGroup,
   SplitHandle,
   SplitPanel,
@@ -35,6 +36,7 @@ import {
   buildChangeTree,
   checkOf,
   filesOf,
+  ignoreTargets,
   isPartiallyStaged,
   planCommit,
   toggledCheck,
@@ -52,7 +54,7 @@ import { KIND_COLOR, KIND_LABEL, fileCount, formatTime, stashLabel, stripSlash }
 import { call, commands } from "@/platform/ipc";
 import { OperationBanner } from "./operations";
 import { ShelfPanel, loadShelves, useShelf } from "./shelf";
-import { loadStashes, refreshNow, useVcs } from "./store";
+import { refreshNow, repoName, selectRepo, useVcs } from "./store";
 import styles from "./CommitView.module.css";
 
 /** MIME type of changed files dragged between change lists (absolute paths, newline-separated). */
@@ -76,12 +78,24 @@ export function tabItems(tabs: readonly ContentTab[]): TabItem[] {
 
 /** Shelf and stash counts for the tabs (loads the shelves once VCS is available). */
 export function useStashTabCounts(available: boolean) {
-  const stashCount = useVcs((s) => s.stashes.length);
+  const roots = useVcs((s) => s.roots);
+  const version = useVcs((s) => s.version);
+  const [stashCount, setStashCount] = useState(0);
+  useEffect(() => {
+    let live = true;
+    if (available)
+      void Promise.all(roots.map((r) => call(commands.vcsStashes(r))))
+        .then((lists) => live && setStashCount(lists.reduce((n, list) => n + list.length, 0)))
+        .catch(() => undefined);
+    return () => {
+      live = false;
+    };
+  }, [available, roots, version]);
   const shelfCount = useShelf((s) => s.shelves.length);
   useEffect(() => {
     if (available) void loadShelves().catch(() => undefined);
   }, [available]);
-  return { stashCount, shelfCount };
+  return { stashCount: available ? stashCount : 0, shelfCount };
 }
 
 /** "Commit" / "Shelf" / "Stash" content tabs; they stand in for the tool window title. */
@@ -181,11 +195,12 @@ function listMenu(id: string, active: boolean, paths: string[]): MenuItem[] {
   ];
 }
 
-function nodeMenu(nodes: ChangeNode[]): MenuItem[] {
+function nodeMenu(nodes: ChangeNode[], repos: readonly string[]): MenuItem[] {
   const files = filesOf(nodes);
   const paths = files.map((f) => f.path);
   const first = nodes.find((n) => n.type === "file");
   const untracked = files.filter((f) => f.unstaged === "untracked");
+  const toIgnore = ignoreTargets(nodes, repos);
   const conflicted = files.filter((f) => f.unstaged === "conflicted");
   const items: MenuItem[] = [
     { kind: "action", action: "vcs.showDiff", arg: first?.path },
@@ -203,6 +218,16 @@ function nodeMenu(nodes: ChangeNode[]): MenuItem[] {
     { kind: "action", action: "vcs.rollback", arg: paths, label: "Rollback…" },
     ...(untracked.length
       ? [{ kind: "action" as const, action: "vcs.addToVcs", arg: untracked.map((f) => f.path) }]
+      : []),
+    ...(toIgnore.length
+      ? [
+          {
+            kind: "action" as const,
+            action: "vcs.ignoreShared",
+            arg: toIgnore,
+            label: "Add to .gitignore",
+          },
+        ]
       : []),
     {
       label: "Stage",
@@ -380,6 +405,7 @@ export function ChangesTree({ mode }: { mode: "commit" | "local" | "dialog" }) {
         <IconButton icon="refresh" title="Refresh" size="small" onClick={() => void refreshNow()} />
         {mode === "local" && <IconButton icon="commit" action="vcs.commit" size="small" />}
         <IconButton icon="undo" action="vcs.rollback" size="small" />
+        {mode === "local" && <IconButton icon="changelist" action="vcs.changelist.new" size="small" />}
         {mode !== "dialog" && <IconButton icon="git-pull" action="vcs.update" size="small" />}
         <IconButton
           ref={viewRef}
@@ -465,7 +491,7 @@ export function ChangesTree({ mode }: { mode: "commit" | "local" | "dialog" }) {
               return;
             }
             const nodes = [...sel].map((k) => byKey.get(k)).filter((n): n is ChangeNode => !!n);
-            showContextMenu(e, nodeMenu(nodes.length ? nodes : [node]));
+            showContextMenu(e, nodeMenu(nodes.length ? nodes : [node], repos));
           }}
           aria-label="Changes"
           empty={
@@ -825,17 +851,50 @@ function CommitPanel({ included }: { included: number }) {
 // ---------------------------------------------------------------------------
 
 export function StashesPanel() {
-  const stashes = useVcs((s) => s.stashes);
-  const loaded = useVcs((s) => s.stashesLoaded);
+  const repo = useVcs((s) => s.repo);
+  const repos = useVcs((s) => s.roots);
+  const version = useVcs((s) => s.version);
+  const [tick, setTick] = useState(0);
   const [active, setActive] = useState(0);
+  const request = useMemo(() => ({ repos, repo, version, tick }), [repos, repo, version, tick]);
+  const [result, setResult] = useState<{
+    request: typeof request;
+    stashes: (import("@/bindings").Stash & { repo: string | null })[];
+    error: string | null;
+  } | null>(null);
+  const loaded = result?.request === request;
+  const stashes = loaded ? result.stashes : [];
+  const error = loaded ? result.error : null;
   useEffect(() => {
-    void loadStashes().catch(() => undefined);
-  }, []);
+    let live = true;
+    void Promise.all(
+      (request.repos.length ? request.repos : [request.repo]).map(async (root) =>
+        (await call(commands.vcsStashes(root))).map((s) => ({ ...s, repo: root })),
+      ),
+    )
+      .then((lists) => {
+        if (live) setResult({ request, stashes: lists.flat(), error: null });
+      })
+      .catch((e) => {
+        if (live) setResult({ request, stashes: [], error: String(e) });
+      });
+    return () => {
+      live = false;
+    };
+  }, [request]);
   const current = stashes[active];
   return (
     <div className={styles.changes}>
       <div className={styles.toolbar} role="toolbar" aria-label={tx("Stashes")}>
-        <IconButton icon="refresh" title="Refresh" size="small" onClick={() => void loadStashes()} />
+        {repos.length > 1 && (
+          <Select
+            aria-label="Repository"
+            value={repo}
+            onChange={(root) => void selectRepo(root)}
+            options={repos.map((root) => ({ value: root, label: repoName(root) }))}
+          />
+        )}
+        <IconButton icon="refresh" title="Refresh" size="small" onClick={() => setTick((n) => n + 1)} />
         <IconButton icon="plus" title="Stash Changes…" size="small" onClick={() => void stashChanges()} />
         <span className={styles.sep} />
         <IconButton
@@ -843,52 +902,55 @@ export function StashesPanel() {
           title="Apply Stash"
           size="small"
           disabled={!current}
-          onClick={() => current && void applyStash(current.index, false)}
+          onClick={() => current && void applyStash(current.index, false, current.repo)}
         />
         <IconButton
           icon="undo"
           title="Pop Stash (Apply and Drop)"
           size="small"
           disabled={!current}
-          onClick={() => current && void applyStash(current.index, true)}
+          onClick={() => current && void applyStash(current.index, true, current.repo)}
         />
         <IconButton
           icon="trash"
           title="Drop Stash"
           size="small"
           disabled={!current}
-          onClick={() => current && void dropStash(current.index, current.message)}
+          onClick={() => current && void dropStash(current.index, current.message, current.repo)}
         />
       </div>
       <List
         items={stashes}
-        getKey={(s) => String(s.index)}
+        getKey={(s) => `${s.repo}:${s.index}`}
         activeIndex={Math.min(active, Math.max(0, stashes.length - 1))}
         onActiveChange={setActive}
         rowHeight={22}
         aria-label="Stashes"
         className={styles.stashList}
-        empty={<span className={styles.empty}>{loaded ? tx("No stashes") : tx("Loading…")}</span>}
+        empty={<span className={styles.empty}>{error ?? (loaded ? tx("No stashes") : tx("Loading…"))}</span>}
         onActivate={(s, _i, e) => {
           if (e.type === "click" && (e as MouseEvent).detail < 2) return;
-          void applyStash(s.index, false);
+          void applyStash(s.index, false, s.repo);
         }}
         onContextMenu={(s, i, e) => {
           e.preventDefault();
           setActive(i);
           showContextMenu(e, [
-            { label: "Apply Stash", icon: "check", run: () => void applyStash(s.index, false) },
-            { label: "Pop Stash", icon: "undo", run: () => void applyStash(s.index, true) },
-            { label: "Unstash…", run: () => showUnstashDialog(s.index) },
+            { label: "Apply Stash", icon: "check", run: () => void applyStash(s.index, false, s.repo) },
+            { label: "Pop Stash", icon: "undo", run: () => void applyStash(s.index, true, s.repo) },
+            { label: "Unstash…", run: () => showUnstashDialog(s.index, s.repo) },
             { kind: "separator" },
-            { label: "Drop Stash", icon: "trash", run: () => void dropStash(s.index, s.message) },
+            { label: "Drop Stash", icon: "trash", run: () => void dropStash(s.index, s.message, s.repo) },
           ]);
         }}
         renderItem={(s) => {
           const { branch, text } = stashLabel(s.message);
           return (
             <span className={styles.stashRow} title={`stash@{${s.index}}: ${s.message}`}>
-              <span className={styles.stashMessage}>{text}</span>
+              <span className={styles.stashMessage}>
+                {repos.length > 1 && s.repo ? `${repoName(s.repo)} · ` : ""}
+                {text}
+              </span>
               {branch && <span className={styles.detail}>{branch}</span>}
               <span className={styles.detail}>{formatTime(s.timeMs)}</span>
             </span>

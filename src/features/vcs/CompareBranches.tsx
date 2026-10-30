@@ -6,6 +6,7 @@ import { call, commands } from "@/platform/ipc";
 import { Dialog, List, Spinner, Tabs, T } from "@/ui";
 import { openDialog } from "./dialogs";
 import { formatTime } from "./model";
+import { showCompareRevisions } from "./operations";
 import { currentRepo, useVcs } from "./store";
 import styles from "./common.module.css";
 import { tx } from "@/platform/i18n";
@@ -24,7 +25,7 @@ const commitsBetween = (from: string, to: string, repo: string | null = currentR
       skip: 0,
       limit: LIMIT,
     }),
-  );
+  ).then((commits) => commits.map((c) => ({ ...c, repo })));
 
 export function showCompareBranches(branch: string) {
   const current = useVcs.getState().branch?.head ?? "HEAD";
@@ -89,7 +90,7 @@ function CommitList({
           }
           onActivate={(c) => {
             onClose();
-            void executeAction("vcs.showCommit", c.id);
+            void executeAction("vcs.showCommit", c);
           }}
           renderItem={(c) => (
             <span className={styles.commitRow} style={{ flex: 1, padding: 0 }}>
@@ -106,12 +107,13 @@ function CommitList({
 }
 
 function CompareDialog({ branch, current, onClose }: { branch: string; current: string; onClose: () => void }) {
+  const [repo] = useState(currentRepo);
   const [data, setData] = useState<{ incoming: Commit[]; outgoing: Commit[] } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState("incoming");
   useEffect(() => {
     let alive = true;
-    Promise.all([commitsBetween("HEAD", branch), commitsBetween(branch, "HEAD")])
+    Promise.all([commitsBetween("HEAD", branch, repo), commitsBetween(branch, "HEAD", repo)])
       .then(([incoming, outgoing]) => {
         if (alive) setData({ incoming, outgoing });
       })
@@ -127,7 +129,18 @@ function CompareDialog({ branch, current, onClose }: { branch: string; current: 
       title={tx`Compare ${current} with ${branch}`}
       onClose={onClose}
       width={640}
-      buttons={[{ label: "Close", role: "cancel" }]}
+      buttons={[
+        {
+          label: "Show Diff",
+          role: "default",
+          onClick: () => {
+            onClose();
+            // Whole-project diff: every file that differs between the branches.
+            showCompareRevisions(branch, "HEAD", branch, current);
+          },
+        },
+        { label: "Close", role: "cancel" },
+      ]}
     >
       <Tabs
         variant="compact"

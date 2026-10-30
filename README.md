@@ -15,6 +15,8 @@
   <a href="#benchmark">Benchmark</a>
   &nbsp;·&nbsp;
   <a href="#build">Build</a>
+  &nbsp;·&nbsp;
+  <a href="https://discord.gg/2Zy4yn7gP">Discord</a>
 </p>
 
 https://github.com/user-attachments/assets/234dd54c-1255-4b3a-b35c-533d78d737c0
@@ -70,6 +72,15 @@ the entry and never deletes files. Closed entries survive project switches and a
 If a folder is missing or unreadable, opening it leaves the current project unchanged.
 If loading fails after closing the previous project, both entries remain in the list and
 the window has no active project; either project can be opened again from the sidebar.
+
+Native notebook execution tests are opt-in and need two distinct Python environments
+with `ipykernel` installed:
+
+```sh
+OPENIDEA_TEST_PYTHON=/first/env/bin/python \
+OPENIDEA_TEST_PYTHON_SECOND=/second/env/bin/python \
+cargo test -p ide-notebook --test kernel_runtime -- --ignored --test-threads=1
+```
 
 ## License
 

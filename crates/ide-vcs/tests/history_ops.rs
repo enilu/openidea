@@ -113,7 +113,7 @@ fn merge_versions_put_the_users_work_on_the_left() {
     let repo = fx.repo();
     let topic = fx.git(&["rev-parse", "topic"]);
     assert!(repo.rebase("main").is_err());
-    let v = repo.merge_versions(&fx.path("f.txt")).unwrap();
+    let v = repo.merge_versions(&fx.path("f.txt"), encoding_rs::UTF_8).unwrap();
     assert_eq!(v.ours.as_deref(), Some("topic\n"));
     assert_eq!(v.theirs.as_deref(), Some("main\n"));
     assert_eq!(v.base.as_deref(), Some("base\n"));
@@ -129,7 +129,7 @@ fn merge_versions_put_the_users_work_on_the_left() {
 
     // Merge: not swapped; the merged branch is named.
     assert!(repo.merge("main").is_err());
-    let v = repo.merge_versions(&fx.path("f.txt")).unwrap();
+    let v = repo.merge_versions(&fx.path("f.txt"), encoding_rs::UTF_8).unwrap();
     assert_eq!(v.ours.as_deref(), Some("topic\n"));
     assert_eq!(v.theirs.as_deref(), Some("main\n"));
     assert!(!v.sides.reversed);
@@ -140,7 +140,7 @@ fn merge_versions_put_the_users_work_on_the_left() {
     // Cherry-pick: not swapped; the picked commit is named.
     let main = fx.git(&["rev-parse", "main"]);
     assert!(repo.cherry_pick(std::slice::from_ref(&main), &cancel, &out).is_err());
-    let v = repo.merge_versions(&fx.path("f.txt")).unwrap();
+    let v = repo.merge_versions(&fx.path("f.txt"), encoding_rs::UTF_8).unwrap();
     assert_eq!(v.ours.as_deref(), Some("topic\n"));
     assert!(!v.sides.reversed);
     assert_eq!(v.sides.operation.as_deref(), Some("cherry-pick"));
@@ -374,7 +374,7 @@ fn unshelve_with_conflict_leaves_merge_state() {
     assert_eq!(outcome.conflicts, vec!["f.txt".to_string()]);
     let text = fx.read("f.txt");
     assert!(text.contains("<<<<<<<") && text.contains("SHELVED") && text.contains("COMMITTED"), "{text}");
-    let (base, ours, theirs) = repo.conflict_versions(&fx.path("f.txt")).unwrap();
+    let (base, ours, theirs) = repo.conflict_versions(&fx.path("f.txt"), encoding_rs::UTF_8).unwrap();
     assert!(base.is_some() && ours.unwrap().contains("COMMITTED") && theirs.unwrap().contains("SHELVED"));
     // Kept on the shelf when not removing.
     assert_eq!(shelf::list(&shelf).unwrap().len(), 1);
@@ -498,10 +498,21 @@ fn push_branch_and_up_to_revision() {
     assert!(repo.push_branch("nope", None, false, &cancel, &out).is_err());
 
     // An edited target: same remote, another branch name; the upstream stays as it was.
-    repo.push_branch_to("main", None, "review/main", false, &cancel, &out).unwrap();
+    fn opts<'a>(target: Option<&'a str>, remote: Option<&'a str>) -> PushBranchOptions<'a> {
+        PushBranchOptions { target, remote, ..Default::default() }
+    }
+    repo.push_branch_to("main", opts(Some("review/main"), None), &cancel, &out).unwrap();
     assert_eq!(git_in(&bare, &["rev-parse", "review/main"]), c3);
     assert_eq!(fx.git(&["rev-parse", "--abbrev-ref", "main@{upstream}"]), "origin/main");
-    assert!(repo.push_branch_to("main", None, "bad..name", false, &cancel, &out).is_err());
+    assert!(repo.push_branch_to("main", opts(Some("bad..name"), None), &cancel, &out).is_err());
+
+    // A chosen remote: same branch name, pushed to the other remote.
+    let bare2 = fx._tmp.path().join("backup.git");
+    git_in(fx._tmp.path(), &["init", "-q", "--bare", bare2.to_str().unwrap()]);
+    fx.git(&["remote", "add", "backup", bare2.to_str().unwrap()]);
+    repo.push_branch_to("main", opts(None, Some("backup")), &cancel, &out).unwrap();
+    assert_eq!(git_in(&bare2, &["rev-parse", "main"]), c3);
+    assert_eq!(fx.git(&["rev-parse", "--abbrev-ref", "main@{upstream}"]), "origin/main");
 }
 
 #[test]

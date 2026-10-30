@@ -1,3 +1,4 @@
+import { commitRepo } from "./multiRoot";
 /** VCS actions (ids match keymaps/intellij-macos.ts where bound). */
 import { registerActions, type Action } from "@/platform/actions";
 import { getContext } from "@/platform/context";
@@ -39,6 +40,8 @@ import {
 } from "./gitMenuDialogs";
 import { refreshNow, repoName } from "./store";
 import { tx } from "@/platform/i18n";
+
+import { addToIgnore } from "./ignore";
 
 const VCS = "vcsAvailable";
 const IN_COMMIT_WINDOW = "vcsAvailable && activeToolWindow == commit";
@@ -448,11 +451,21 @@ export function registerVcsActions(): () => void {
       when: VCS,
       hidden: true,
       run: ({ arg }) => {
-        if (typeof arg !== "string") return;
+        const commit = arg && typeof arg === "object" && "id" in arg ? (arg as import("@/bindings").Commit) : null;
+        const id = typeof arg === "string" ? arg : commit?.id;
+        if (!id) return;
         showGitWindow();
-        void revealCommit(arg);
+        void revealCommit(id, commit ? commitRepo(commit) : undefined);
       },
     },
+    ...(["gitignore", "localExclude"] as const).map((destination): Action => ({
+      id: destination === "gitignore" ? "vcs.ignoreShared" : "vcs.ignoreLocal",
+      title: destination === "gitignore" ? "Add to .gitignore" : "Add to .git/info/exclude",
+      category: "Git",
+      when: VCS,
+      keywords: ["ignore", "unversioned", "exclude"],
+      run: ({ arg }) => addToIgnore(contextPaths(arg), destination),
+    })),
     {
       id: "vcs.addToVcs",
       title: "Add to VCS",

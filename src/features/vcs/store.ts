@@ -225,14 +225,16 @@ export function applyStatus(status: FileStatus[], branch: BranchInfo | null) {
 }
 
 export async function loadBranches(): Promise<Branch[]> {
-  const branches = await call(commands.vcsBranches(currentRepo()));
-  useVcs.setState({ branches, branchesLoaded: true });
+  const repo = currentRepo();
+  const branches = await call(commands.vcsBranches(repo));
+  if (repo === currentRepo()) useVcs.setState({ branches, branchesLoaded: true });
   return branches;
 }
 
 export async function loadStashes(): Promise<Stash[]> {
-  const stashes = await call(commands.vcsStashes(currentRepo()));
-  useVcs.setState({ stashes, stashesLoaded: true });
+  const repo = currentRepo();
+  const stashes = await call(commands.vcsStashes(repo));
+  if (repo === currentRepo()) useVcs.setState({ stashes, stashesLoaded: true });
   return stashes;
 }
 
@@ -273,7 +275,12 @@ export function installVcsStore(): () => void {
     if (useVcs.getState().available) scheduleRefresh(200);
     else void discoverRoots();
   });
-  const offFs = onIdeEvent("fsChanged", () => scheduleRefresh(250));
+  // `.git/**` internals show up through other watchers too; refreshing status
+  // on those alone rewrites `.git/index` and re-triggers this handler.
+  const offFs = onIdeEvent("fsChanged", (e) => {
+    const worktree = [...e.created, ...e.modified, ...e.removed].some((p) => !/(^|[/\\])\.git([/\\]|$)/.test(p));
+    if (worktree) scheduleRefresh(250);
+  });
   const offSettings = onWorkflowSettingsChange(
     (s) => s.vcs.showDirtyDirectories,
     (show) => {

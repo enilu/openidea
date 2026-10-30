@@ -8,8 +8,8 @@ import {
   insertTab,
   smartBackspace,
   smartBackspaceApplies,
+  tabOut,
   tabOutOfScope,
-  tabOutScopes,
 } from "./smartKeys";
 
 /** One unit (2) deeper after a (non-blank) line ending in `{`, one less on a line starting with `}`. */
@@ -101,6 +101,7 @@ describe("smart backspace", () => {
   it("applies in 'proper indent' mode except in indentation-based languages", () => {
     expect(smartBackspaceApplies("autoindent", "java")).toBe(true);
     expect(smartBackspaceApplies("autoindent", "python")).toBe(false);
+    expect(smartBackspaceApplies("autoindent", "gdscript")).toBe(false);
     expect(smartBackspaceApplies("nearest", "java")).toBe(false);
   });
 
@@ -136,7 +137,7 @@ describe("smart backspace", () => {
 });
 
 describe("tab out of pairs", () => {
-  const ext = [closeBrackets(), tabOutScopes];
+  const ext = [closeBrackets(), tabOut];
   const type = (v: EditorView, ch: string) => {
     const tr = insertBracket(v.state, ch);
     if (tr) v.dispatch(tr);

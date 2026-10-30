@@ -50,7 +50,7 @@ import { isEmptyMarkup, renderCode, renderMarkup } from "./markdown";
 import { selectableText } from "@/ui/selectableText";
 import { iconNode } from "./iconMarkup";
 import { parameterInfoOrLeave, triggerSignatureHelp } from "./signature";
-import { serverBackoff } from "./availability";
+import { featureBackoff } from "./availability";
 import { pathCompletionSource } from "./fileReferences";
 import { editorPrefs } from "@/platform/editorSettings";
 import { tx } from "@/platform/i18n";
@@ -201,13 +201,17 @@ export function applyLspCompletion(
   const item = completion.resolved ?? resolvedItems.get(completion.lsp) ?? completion.lsp;
   const state = view.state;
   const delta = to - req.pos;
-  const mapOld = (offset: number) =>
-    Math.max(0, Math.min(state.doc.length, offset < req.pos ? offset : offset + delta));
+  const mapOld = (offset: number, assoc = 1) =>
+    Math.max(
+      0,
+      Math.min(state.doc.length, offset < req.pos || (offset === req.pos && assoc < 0) ? offset : offset + delta),
+    );
 
   let start = from;
   let end = to;
   if (item.replaceRange) {
-    start = Math.min(mapOld(posToOffset(req.text, item.replaceRange.start)), to);
+    // An edit requested just after a trigger must include the prefix typed since then.
+    start = Math.min(mapOld(posToOffset(req.text, item.replaceRange.start), -1), to);
     end = Math.max(mapOld(posToOffset(req.text, item.replaceRange.end)), to);
   }
   if (mode === "replace") {
@@ -410,6 +414,9 @@ interface RichCompletion extends Completion {
   typeText?: string;
 }
 
+/** Documents the server could not complete in, so typing doesn't ask again until a server is ready. */
+const completionBackoff = featureBackoff();
+
 async function lspCompletionSource(ctx: CompletionContext): Promise<CompletionResult | null> {
   const doc = ctx.state.facet(lspDoc);
   if (!doc || doc.readOnly) return null;
@@ -417,8 +424,7 @@ async function lspCompletionSource(ctx: CompletionContext): Promise<CompletionRe
   const trigger = triggerCharacter(ctx.state.sliceDoc(Math.max(0, ctx.pos - 2), ctx.pos));
   if (!ctx.explicit && !word && !trigger) return null;
   if (!ctx.explicit && word && !trigger && /^\d/.test(word.text)) return null;
-  if (serverBackoff.active(doc.doc)) return fallback(ctx);
-
+  if (completionBackoff.active(doc.doc)) return fallback(ctx);
   cancelInflight();
   const id = nextRequestId();
   inflight = id;
@@ -433,7 +439,7 @@ async function lspCompletionSource(ctx: CompletionContext): Promise<CompletionRe
     );
   } catch (e) {
     if (isUnavailable(e)) {
-      serverBackoff.mark(doc.doc);
+      completionBackoff.mark(doc.doc);
       return fallback(ctx);
     }
     return null;

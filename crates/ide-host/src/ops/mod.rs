@@ -15,7 +15,9 @@ pub mod history;
 pub mod java;
 pub mod lsp;
 pub mod nav;
+pub mod notebook;
 pub mod project;
+mod python;
 pub mod refactor;
 pub mod run;
 pub mod sdk;
@@ -59,6 +61,7 @@ impl<T> Clone for Channel<T> {
 pub fn register_all(d: &mut crate::rpc::Dispatcher) {
     agent::register(d);
     lsp::register(d);
+    notebook::register(d);
     nav::register(d);
     refactor::register(d);
     analysis::register(d);
