@@ -1,9 +1,10 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import type { RunConfig } from "@/platform/ipc";
 import type { RunTargetValid } from "@/platform/remoteSettings";
 import { useWorkflowSettings } from "@/platform/workflowSettings";
 import { EmptyState, IconButton, SplitGroup, SplitHandle, SplitPanel, Tabs, type TabItem, T } from "@/ui";
 import { executeAction } from "@/platform/actions";
-import { shortcutLabel } from "@/platform/keymap";
+import { formatBinding, hostBinding, shortcutLabel } from "@/platform/keymap";
 import { ConsoleModel } from "./console";
 import { ConsoleView } from "./ConsoleView";
 import { TerminalConsole } from "./TerminalConsole";
@@ -11,9 +12,12 @@ import { runDirectory } from "./navigate";
 import { remoteLabel } from "./remote";
 import {
   acceptsInput,
+  baseConfigOf,
+  canRunSelectedTests,
   clearConsole,
   closeSessionTab,
   closeStdin,
+  debugSession,
   failedTests,
   rerunFailed,
   rerunSession,
@@ -26,9 +30,14 @@ import {
   useRun,
   writeTerminal,
   type RunSession,
+  isLive,
 } from "./store";
+import { rerunFailedConfigs } from "./testing/rerun";
 import { TestTreeView, formatDuration } from "./TestTreeView";
 import { StackTracePanel, closeStackTrace, useStackTraces, type StackTraceTab } from "./stackTrace";
+import { showApplicationUpdate, useApplicationUpdates } from "./applicationUpdate";
+import { isUpdatable } from "./updatePolicies";
+import { configIcon } from "./configs";
 import styles from "./Run.module.css";
 import { tx } from "@/platform/i18n";
 
@@ -36,13 +45,31 @@ function failed(s: RunSession): boolean {
   return s.status === "failed" || (s.status === "finished" && s.exitCode !== 0 && !s.stopped);
 }
 
-function sessionIcon(s: RunSession): string {
-  if (s.status === "running" || s.status === "starting") return s.config.isTest ? "check" : "run";
+/**
+ * Tab icon, IDEA's three states: the green execution arrow while the process is alive,
+ * the red error badge for a failed exit, and once the process ended the run
+ * configuration's own icon (Services keeps the same model, see services.tsx).
+ */
+export function sessionIcon(s: RunSession): string {
+  if (isLive(s)) return s.config.isTest ? "check" : "run";
   if (failed(s)) return "error";
-  return s.config.isTest ? "check" : "run";
+  // Ended (exit or stop): the configuration's own icon — the green arrow stays "still running".
+  return configIcon(s.config);
 }
 
-export function SessionPanel({ session }: { session: RunSession }) {
+export function SessionPanel({
+  session,
+  onRerun,
+  onDebug,
+  onStop,
+}: {
+  session: RunSession;
+  onRerun?: (() => void) | null;
+  /** Override the Debug button (Services: rerun the attached debugger's launch); null disables it. */
+  onDebug?: (() => void) | null;
+  onStop?: () => void;
+}) {
+  const updating = useApplicationUpdates((s) => s.ids.has(session.id));
   const version = useRun((s) => s.versions[session.id] ?? 0);
   const rt = runtime(session.id);
   const [follow, setFollow] = useState(true);
@@ -51,8 +78,34 @@ export function SessionPanel({ session }: { session: RunSession }) {
   const [wrapOverride, setWrapOverride] = useState<boolean | null>(null);
   const softWrap = wrapOverride ?? defaultWrap;
   const [selectedTest, setSelectedTest] = useState<string | null>(null);
-  const running = session.status === "running" || session.status === "starting";
+  const [findOpen, setFindOpen] = useState(false);
+  const running = isLive(session);
   const cwd = runDirectory(session.config.cwd);
+  const baseConfig = useRun(() => baseConfigOf(session));
+  // Test results mutate in place; their version refreshes the selection.
+  const failedSelection = useMemo(
+    () => (running ? [] : rerunFailedConfigs(baseConfig, failedTests(session.id))),
+    [running, baseConfig, session.id, version], // eslint-disable-line react-hooks/exhaustive-deps
+  );
+  const [resolvedSelection, setResolvedSelection] = useState<{
+    request: Promise<RunConfig[]>;
+    supported: boolean;
+  } | null>(null);
+  useEffect(() => {
+    let current = true;
+    if (failedSelection instanceof Promise) {
+      void failedSelection.then((configs) => {
+        if (current) setResolvedSelection({ request: failedSelection, supported: configs.length > 0 });
+      });
+    }
+    return () => {
+      current = false;
+    };
+  }, [failedSelection]);
+  const canRerunFailed =
+    failedSelection instanceof Promise
+      ? resolvedSelection?.request === failedSelection && resolvedSelection.supported
+      : failedSelection.length > 0;
 
   // Selecting a test with captured output shows just that output (like IDEA).
   const testModel = useMemo(() => {
@@ -93,6 +146,8 @@ export function SessionPanel({ session }: { session: RunSession }) {
           softWrap={softWrap}
           follow={testModel ? false : follow}
           onFollowChange={setFollow}
+          findOpen={findOpen}
+          onFindOpenChange={setFindOpen}
           cwd={cwd}
           onClear={() => clearConsole(session.id)}
           input={
@@ -119,7 +174,17 @@ export function SessionPanel({ session }: { session: RunSession }) {
           iconSize={14}
           title="Rerun"
           shortcut={shortcutLabel("run.rerun")}
-          onClick={() => rerunSession(session.id)}
+          disabled={onRerun === null}
+          onClick={onRerun ?? (() => rerunSession(session.id))}
+        />
+        {/* Switch the launch mode: the same configuration started under the debugger. */}
+        <IconButton
+          icon="debug"
+          iconSize={14}
+          title="Debug"
+          shortcut={shortcutLabel("run.debug")}
+          disabled={onDebug === null}
+          onClick={onDebug ?? (() => void debugSession(session.id))}
         />
         {rt.tests && (
           <IconButton
@@ -128,21 +193,38 @@ export function SessionPanel({ session }: { session: RunSession }) {
             tone="danger"
             title="Rerun Failed Tests"
             shortcut={shortcutLabel("run.rerunFailed")}
-            disabled={running || failedTests(session.id).length === 0}
-            onClick={() => rerunFailed(session.id)}
+            disabled={!canRerunFailed}
+            onClick={() => void rerunFailed(session.id)}
           />
         )}
         <IconButton
           icon="stop"
           iconSize={13}
-          title="Stop"
-          tone={running ? "danger" : "default"}
-          disabled={!running}
-          onClick={() => void stopSession(session.id)}
+          title={session.status === "stopping" ? tx`Stopping… (click to kill)` : "Stop"}
+          tone={running || onStop ? "danger" : "default"}
+          disabled={!running && !onStop}
+          onClick={onStop ?? (() => void stopSession(session.id))}
         />
+        {isUpdatable(session.config) && (
+          <IconButton
+            icon="refresh"
+            title="Update Application"
+            shortcut={shortcutLabel("run.updateApplication")}
+            disabled={session.status !== "running" || updating}
+            onClick={() => showApplicationUpdate(session.id)}
+          />
+        )}
         <div className={styles.toolbarSep} />
         {!rt.terminal && (
           <>
+            <IconButton
+              icon="search"
+              iconSize={14}
+              title="Find…"
+              shortcut={formatBinding(hostBinding("Meta+F"))}
+              pressed={findOpen}
+              onClick={() => setFindOpen((v) => !v)}
+            />
             <IconButton
               icon="arrow-down"
               iconSize={14}
@@ -173,6 +255,7 @@ export function SessionPanel({ session }: { session: RunSession }) {
                 running={running}
                 selected={selectedTest}
                 onSelect={setSelectedTest}
+                canRunTests={(ids) => canRunSelectedTests(session.id, ids)}
                 onRunTests={(ids, debug) => void runSelectedTests(session.id, ids, debug)}
               />
             </SplitPanel>

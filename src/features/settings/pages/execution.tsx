@@ -3,6 +3,7 @@
  * Stepping), Python Debugger and Run/Debug. Consumed by the run and debugger
  * features (and `ide-run` for encoding / termination timeout).
  */
+import { CMakeProfiles } from "./cmake";
 import { WORKFLOW_LIMITS } from "@/platform/workflowSettings";
 import type { SelectOption } from "@/ui";
 import { GlobListEditor, NumberInput, Row } from "../components/Form";
@@ -91,6 +92,25 @@ function TooltipDelayRow() {
 
 export const EXECUTION_PAGES: PageSpec[] = [
   {
+    id: "build.cmake",
+    title: "CMake",
+    group: BUILD_GROUP,
+    order: 357,
+    projectScope: true,
+    defaultScope: "project",
+    keywords: [
+      "profile",
+      "generator",
+      "Ninja",
+      "Build type",
+      "CMake arguments",
+      "Build directory",
+      "Build arguments",
+      "Environment variables",
+    ],
+    component: CMakeProfiles,
+  },
+  {
     id: "build.gradle",
     projectScope: true,
     defaultScope: "project",
@@ -98,6 +118,9 @@ export const EXECUTION_PAGES: PageSpec[] = [
     group: BUILD_GROUP,
     order: 358,
     keywords: [
+      "Build and run using",
+      "delegate",
+      "JavaExec",
       "Gradle JVM",
       "JDK",
       "JAVA_HOME",
@@ -121,7 +144,24 @@ export const EXECUTION_PAGES: PageSpec[] = [
     group: BUILD_GROUP,
     // IntelliJ IDEA: Build Tools › Maven, before Console / Debugger.
     order: 359,
-    keywords: ["maven home", "mvn", "mvnw", "wrapper", "settings.xml", "user settings", "local repository", "m2"],
+    keywords: [
+      "JRE",
+      "runner",
+      "JDK",
+      "JAVA_HOME",
+      "maven home",
+      "mvn",
+      "mvnw",
+      "wrapper",
+      "settings.xml",
+      "user settings",
+      "local repository",
+      "m2",
+      "thread count",
+      "threads",
+      "-T",
+      "parallel",
+    ],
     component: MavenPage,
   },
   {
@@ -278,7 +318,7 @@ export const EXECUTION_PAGES: PageSpec[] = [
             integer: true,
             step: 500,
             unit: "ms",
-            hint: "After Stop, the process gets this long to exit after the interrupt before it is killed.",
+            hint: "After a configuration's stop command, the process gets this long to exit before it is interrupted. Press Stop again to kill a process that doesn't exit.",
           },
         ],
       },

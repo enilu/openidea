@@ -2,7 +2,8 @@
  * Rename (⇧F6): `lsp_prepare_rename` → the name is edited in place with this
  * file's occurrences linked (`inplaceRename.ts`; ⇧F6 again opens the name
  * dialog) → `lsp_rename` → preview dialog when the edit spans several files
- * (or moves files), otherwise applied directly via `apply_workspace_edit`.
+ * (or moves files) or may have missed usages, otherwise applied directly via
+ * `apply_workspace_edit`.
  *
  * Dumb mode: when the server is not ready / failing, or answers nothing over
  * code with syntax errors, a *local* variable is renamed in place from the
@@ -11,10 +12,21 @@
  * symbols — is left to the server. Ambiguous cases ask first.
  */
 import type { EditorView } from "@codemirror/view";
-import { commands, isCancelled, type Pos, type WorkspaceEdit } from "@/platform/ipc";
-import { whenSynced, type EditorDocContext } from "@/editor/api";
+import {
+  commands,
+  IpcError,
+  isCancelled,
+  isNoServer,
+  nextRequestId,
+  unavailableText,
+  type Pos,
+  type RequestId,
+  type WorkspaceEdit,
+} from "@/platform/ipc";
+import { executeAction } from "@/platform/actions";
+import { whenAllSynced, whenSynced, type EditorDocContext } from "@/editor/api";
 import { structure } from "@/editor/structure";
-import { docOf, lspRequest, reportLspError } from "./lsp";
+import { docOf, incompleteNote, isUnavailable, lspRequest, reportLspError } from "./lsp";
 import { comparePos, offsetToPos, rangeToOffsets } from "./positions";
 import { showHint } from "./hint";
 import { caretAnchor, openPopup, type PreviewOccurrence } from "./popupStore";
@@ -30,12 +42,25 @@ import {
   type LocalRenamePlan,
 } from "./syntaxFallback";
 import { tx } from "@/platform/i18n";
+import { synchronizeDocumentIndexes } from "@/workbench/contributions";
 
 async function applyEdit(view: EditorView, edit: WorkspaceEdit) {
   try {
+    await whenAllSynced();
     await lspRequest(() => commands.applyWorkspaceEdit(edit));
   } catch (e) {
     reportLspError(view, e, true);
+  }
+}
+
+async function prepareIndexes(view: EditorView, path: string): Promise<boolean> {
+  const before = view.state.doc;
+  try {
+    await synchronizeDocumentIndexes(path);
+    return view.state.doc === before;
+  } catch (e) {
+    reportLspError(view, e, true);
+    return false;
   }
 }
 
@@ -47,9 +72,16 @@ async function hasSyntaxErrors(doc: number): Promise<boolean> {
   }
 }
 
+const renamePreparations = new WeakMap<EditorView, object>();
+
 export async function startRename(view: EditorView) {
   const doc = docOf(view);
   if (!doc) return;
+  const preparation = {};
+  renamePreparations.set(view, preparation);
+  const before = view.state.doc;
+  const current = () =>
+    renamePreparations.get(view) === preparation && view.state.doc === before && docOf(view) === doc;
   // ⇧F6 while renaming in place: the dialog with more options, keeping what was typed.
   const session = inplaceSession(view.state);
   if (session) {
@@ -62,19 +94,32 @@ export async function startRename(view: EditorView) {
     return;
   }
   await whenSynced(view);
+  if (!current()) return;
   const head = view.state.selection.main.head;
   const pos = offsetToPos(view.state.doc, head);
+  if (!(await prepareIndexes(view, doc.path)) || !current()) return;
   let range;
   try {
     range = await lspRequest(() => commands.lspPrepareRename(doc.doc, pos));
+    if (!current()) return;
   } catch (e) {
+    if (!current()) return;
     if (isCancelled(e)) return;
-    if (!(await startSyntaxRename(view, doc, pos))) reportLspError(view, e, true);
+    if (e instanceof IpcError && (e.kind === "outOfSync" || e.kind === "invalidInput")) {
+      reportLspError(view, e, true);
+      return;
+    }
+    if (await startSyntaxRename(view, doc, pos, e, current)) return;
+    // No server covers this file (a plain text file): Shift+F6 renames the file, like IDEA.
+    if (isNoServer(e) && (await executeAction("project.rename"))) return;
+    reportLspError(view, e, true);
     return;
   }
   if (!range) {
     // A normal "can't rename" is respected; over broken code the server may just have given up.
-    if ((await hasSyntaxErrors(doc.doc)) && (await startSyntaxRename(view, doc, pos))) return;
+    if ((await hasSyntaxErrors(doc.doc)) && current() && (await startSyntaxRename(view, doc, pos, undefined, current)))
+      return;
+    if (!current()) return;
     showHint(view, "This element can't be renamed");
     return;
   }
@@ -95,7 +140,7 @@ export async function startRename(view: EditorView) {
   // IDEA renames in place by default: occurrences in this file follow live.
   const state = view.state;
   const others = await linkedOccurrences(view, doc.doc, pos, { from, to }, oldName);
-  if (view.state.doc !== state.doc) return;
+  if (view.state.doc !== state.doc || !current()) return;
   const keys = shortcutLabel("refactor.rename");
   startInplaceRename(view, {
     primary: { from, to },
@@ -145,11 +190,16 @@ export async function renameNamePart(view: EditorView, part: Span, replacement: 
     );
     return true;
   };
+  if (!(await prepareIndexes(view, doc.path))) return;
   let range;
   try {
     range = await lspRequest(() => commands.lspPrepareRename(doc.doc, pos));
   } catch (e) {
     if (isCancelled(e)) return;
+    if (e instanceof IpcError && (e.kind === "outOfSync" || e.kind === "invalidInput")) {
+      reportLspError(view, e, true);
+      return;
+    }
     if (!(await viaSyntax())) refuse("no language server can rename this symbol");
     return;
   }
@@ -208,15 +258,30 @@ async function commitInplace(view: EditorView, doc: EditorDocContext, pos: Pos, 
   await finishRename(view, doc, pos, oldName, newName);
 }
 
+/** The rename waiting for the server's edit: a newer one replaces it. */
+let renameRequest: RequestId | null = null;
+
 async function finishRename(view: EditorView, doc: EditorDocContext, pos: Pos, oldName: string, newName: string) {
   if (!newName || newName === oldName) return;
-  let edit: WorkspaceEdit;
+  if (renameRequest !== null) void commands.cancelRequest(renameRequest).catch(() => {});
+  const request = nextRequestId();
+  renameRequest = request;
+  let renamed;
+  const before = view.state.doc;
   try {
-    edit = await lspRequest(() => commands.lspRename(doc.doc, pos, newName));
+    await synchronizeDocumentIndexes(doc.path);
+    if (renameRequest !== request || view.state.doc !== before) return;
+    renamed = await lspRequest(() => commands.lspRename(request, doc.doc, pos, newName));
+    if (renameRequest !== request) return;
   } catch (e) {
+    if (renameRequest !== request) return;
     reportLspError(view, e, true);
     return;
+  } finally {
+    if (renameRequest === request) renameRequest = null;
   }
+  const { edit, incomplete } = renamed;
+  const note = incomplete && incompleteNote(incomplete, oldName);
   const summary = summarizeWorkspaceEdit(edit);
   if (!summary.files) {
     if (await hasSyntaxErrors(doc.doc)) {
@@ -226,10 +291,12 @@ async function finishRename(view: EditorView, doc: EditorDocContext, pos: Pos, o
         return;
       }
     }
-    showHint(view, "Nothing to rename");
+    if (note) showHint(view, note, { tone: "warning" });
+    else showHint(view, "Nothing to rename");
     return;
   }
-  if (!needsPreview(summary)) {
+  // An edit that may leave usages behind is never applied unseen.
+  if (!renamed.preview && !note && !needsPreview(summary)) {
     await applyEdit(view, edit);
     return;
   }
@@ -237,7 +304,8 @@ async function finishRename(view: EditorView, doc: EditorDocContext, pos: Pos, o
     kind: "preview",
     title: tx`Rename '${oldName}' to '${newName}'`,
     summary,
-    confirmLabel: "Do Refactor",
+    ...(note ? { warnings: [note] } : {}),
+    confirmLabel: note ? "Rename Anyway" : "Do Refactor",
     onConfirm: () => void applyEdit(view, edit),
   });
 }
@@ -258,18 +326,27 @@ async function syntaxPlan(view: EditorView, doc: EditorDocContext, pos: Pos): Pr
 }
 
 /** Opens the rename popup for a syntax-based local rename. False when the fallback can't help. */
-async function startSyntaxRename(view: EditorView, doc: EditorDocContext, pos: Pos): Promise<boolean> {
+async function startSyntaxRename(
+  view: EditorView,
+  doc: EditorDocContext,
+  pos: Pos,
+  cause: unknown,
+  current: () => boolean,
+): Promise<boolean> {
   let result;
   try {
     await whenSynced(view);
     result = await planLocalRename(doc, pos);
   } catch (e) {
+    if (!current()) return true;
     if (!isCancelled(e)) console.debug("[syntax] rename fallback", e);
     return false;
   }
+  if (!current()) return true;
   if (result.kind === "unsupported") return false;
   if (result.kind === "refused") {
-    showHint(view, result.message);
+    const reason = isUnavailable(cause) ? unavailableText(cause) : cause instanceof Error ? cause.message : null;
+    showHint(view, reason ? `${reason}. ${result.message}` : result.message);
     return true;
   }
   const { plan } = result;

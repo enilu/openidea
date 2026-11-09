@@ -11,6 +11,7 @@ import {
   useEffect,
   useId,
   useImperativeHandle,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -18,6 +19,7 @@ import {
   type MouseEvent,
   type ReactNode,
   type Ref,
+  type RefObject,
 } from "react";
 import clsx from "clsx";
 import { useVirtualizer } from "@tanstack/react-virtual";
@@ -28,7 +30,14 @@ import { fuzzyMatch } from "./match";
 import { acquirePopup } from "./popupState";
 import styles from "./Tree.module.css";
 import { T } from "./T";
-import { tx } from "@/platform/i18n";
+import { setContext } from "@/platform/context";
+import { useGivenTx } from "@/platform/i18n";
+import { useTreeReorder, type TreeReorder } from "./treeReorder";
+import { useTreeDirectoryContext } from "./treeDirectoryContext";
+import { useIconRowHeight } from "./iconAppearance";
+
+const DEFAULT_ROW_HEIGHT = 24;
+export type { TreeReorder } from "./treeReorder";
 
 export interface TreeRowState {
   depth: number;
@@ -77,10 +86,12 @@ export interface TreeProps<T> {
   /** Custom row content (after the chevron). Defaults to icon + highlighted label + `getDetail`. */
   renderNode?: (node: T, state: TreeRowState) => ReactNode;
   getIcon?: (node: T, expanded: boolean) => IconName | (string & {}) | undefined;
-  /** Muted trailing text (e.g. a path next to the project root). */
-  getDetail?: (node: T) => string | undefined;
+  /** Muted trailing detail (e.g. a path next to the project root); may include styled content. */
+  getDetail?: (node: T) => ReactNode;
   /** Label colour, e.g. VCS status. */
   getColor?: (node: T) => string | undefined;
+  /** Filesystem directory for actions on the focused selection; groups return null. */
+  getDirectory?: (node: T) => string | null | undefined;
 
   expanded?: ReadonlySet<string>;
   defaultExpanded?: Iterable<string>;
@@ -106,7 +117,103 @@ export interface TreeProps<T> {
   rowClassName?: (node: T) => string | undefined;
   "aria-label"?: string;
   handleRef?: Ref<TreeHandle>;
+  /** Context key set while the tree itself has keyboard focus. */
+  focusContext?: string;
   empty?: ReactNode;
+  /** Rows wider than the pane scroll horizontally instead of clipping. */
+  horizontalScroll?: boolean;
+  /** Optional display reordering between siblings; the caller owns the order. */
+  reorder?: TreeReorder<T>;
+}
+
+/** Remember intrinsic widths by identity, including rows outside the virtual window. */
+function useContentWidth<T>(
+  scroller: RefObject<HTMLDivElement | null>,
+  rows: readonly Row<T>[],
+  enabled: boolean,
+): number {
+  const [width, setWidth] = useState(0);
+  const latestRows = useRef(rows);
+  const schedule = useRef<(() => void) | null>(null);
+  useEffect(() => {
+    if (!enabled) return;
+    const element = scroller.current;
+    if (!element) return;
+    const cache = new Map<string, number>();
+    const observed = new Set<HTMLElement>();
+    let measuredRows: readonly Row<T>[] | null = null;
+    let maximum = 0;
+    let frame = 0;
+    const measure = () => {
+      frame = 0;
+      // Hidden tool windows have no layout. Keep their estimates until shown;
+      // the observer remains attached so showing the window resumes measurement.
+      if (element.clientWidth === 0) return;
+      const rows = latestRows.current;
+      const mounted = [...element.querySelectorAll<HTMLElement>("[data-row]")];
+      let recompute = false;
+      if (measuredRows !== rows) {
+        const keys = new Set(rows.map((row) => row.key));
+        for (const [key, value] of cache) {
+          if (!keys.has(key)) {
+            cache.delete(key);
+            if (value === maximum) recompute = true;
+          }
+        }
+        measuredRows = rows;
+      }
+      // Measure max-content, not the viewport's min-width floor. Batch writes and
+      // restore before paint so selection backgrounds still fill the viewport.
+      const minimums = mounted.map((row) => row.style.minWidth);
+      for (const row of mounted) row.style.minWidth = "0";
+      const widths = mounted.map((row) => row.offsetWidth);
+      mounted.forEach((row, index) => {
+        row.style.minWidth = minimums[index]!;
+        const key = rows[Number(row.dataset.row)]?.key;
+        if (key === undefined) return;
+        const value = widths[index]!;
+        if (cache.get(key) === maximum && value < maximum) recompute = true;
+        cache.set(key, value);
+        maximum = Math.max(maximum, value);
+      });
+      // Ordinary scrolling only touches mounted rows. Scan cached widths only
+      // when the previous maximum was removed or actually became narrower.
+      if (recompute) {
+        maximum = 0;
+        for (const value of cache.values()) maximum = Math.max(maximum, value);
+      }
+      // Reconcile and measure together: never publish an intermediate shrink.
+      setWidth(maximum);
+      // Rows resize without a render when fonts or zoom change.
+      const current = new Set(mounted);
+      for (const row of observed) if (!current.has(row)) observer.unobserve(row);
+      for (const row of mounted) if (!observed.has(row)) observer.observe(row);
+      observed.clear();
+      for (const row of mounted) observed.add(row);
+    };
+    // Measuring forces layout: coalesce renders and resizes into one pass per
+    // frame instead of measuring inside every commit.
+    const request = () => {
+      frame ||= requestAnimationFrame(measure);
+    };
+    const observer = new ResizeObserver(request);
+    observer.observe(element);
+    schedule.current = request;
+    request();
+    return () => {
+      schedule.current = null;
+      cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, [enabled, scroller]);
+  // Rows or the virtual window may have changed; keep `rows` in step with the DOM.
+  useLayoutEffect(() => {
+    latestRows.current = rows;
+    schedule.current?.();
+  });
+  // Offscreen widths are estimates after label/font/indent changes; mounting
+  // measures them afresh, including decreases for the same key.
+  return width;
 }
 
 interface Row<T> {
@@ -126,6 +233,7 @@ function useControllableSet(value: ReadonlySet<string> | undefined, initial: Ite
 }
 
 export function Tree<T>(props: TreeProps<T>) {
+  const given = useGivenTx();
   const {
     roots,
     getKey,
@@ -143,7 +251,7 @@ export function Tree<T>(props: TreeProps<T>) {
     onContextMenu,
     speedSearch = true,
     speedSearchMode = "highlight",
-    rowHeight = 24,
+    rowHeight: fixedRowHeight,
     indent = 20,
     className,
     rowClassName,
@@ -211,11 +319,16 @@ export function Tree<T>(props: TreeProps<T>) {
   }, [allRows, matchMap, query, speedSearchMode]);
 
   const byKey = useMemo(() => new Map(allRows.map((r) => [r.key, r])), [allRows]);
+  const emptyState = !rows.length && !!empty && !query;
+  const contentWidth = useContentWidth(scrollRef, rows, !!props.horizontalScroll);
+  const reordering = useTreeReorder(scrollRef, rows, emptyState ? undefined : props.reorder);
   // aria-posinset / aria-setsize among visible siblings (rows are virtualised).
   const positions = useMemo(() => siblingPositions(rows), [rows]);
   const indexOfKey = useMemo(() => new Map(rows.map((r, i) => [r.key, i])), [rows]);
   const leadIndex = lead != null ? (indexOfKey.get(lead) ?? -1) : -1;
 
+  const themedRowHeight = useIconRowHeight();
+  const rowHeight = fixedRowHeight ?? themedRowHeight ?? DEFAULT_ROW_HEIGHT;
   const virtualizer = useVirtualizer({
     count: rows.length,
     getScrollElement: () => scrollRef.current,
@@ -223,10 +336,26 @@ export function Tree<T>(props: TreeProps<T>) {
     overscan: 12,
     getItemKey: (i) => rows[i]!.key,
   });
+  useEffect(() => virtualizer.measure(), [virtualizer, rowHeight]);
 
+  // Keep the keyboard lead in view when the lead changes — not when its index
+  // shifts because expanding or collapsing elsewhere inserted rows above it:
+  // following the index would yank the viewport from the folder the user just
+  // opened back to the selection.
+  const pendingScrollToLead = useRef<string | null>(null);
   useEffect(() => {
-    if (leadIndex >= 0) virtualizer.scrollToIndex(leadIndex, { align: "auto" });
-  }, [leadIndex, virtualizer]);
+    pendingScrollToLead.current = lead;
+  }, [lead]);
+  // A preselected lead may arrive before its row is loaded. Retry until it
+  // appears, then stop following index changes for that selection.
+  useEffect(() => {
+    const key = pendingScrollToLead.current;
+    if (key == null) return;
+    const i = indexOfKey.get(key);
+    if (i === undefined) return;
+    virtualizer.scrollToIndex(i, { align: "auto" });
+    pendingScrollToLead.current = null;
+  }, [lead, indexOfKey, virtualizer]);
 
   // Speed search owns Escape while active.
   useEffect(() => {
@@ -460,17 +589,46 @@ export function Tree<T>(props: TreeProps<T>) {
   };
 
   const leadRow = leadIndex >= 0 ? rows[leadIndex] : undefined;
+  useTreeDirectoryContext(
+    scrollRef,
+    leadRow && !leadRow.loading && selected.has(leadRow.key) ? props.getDirectory?.(leadRow.node) : undefined,
+    !!props.getDirectory && !emptyState,
+  );
   const noMatch = !!query && matchMap.size === 0;
 
-  if (!rows.length && empty && !query)
-    return <div className={clsx(styles.tree, styles.emptyWrap, className)}>{empty}</div>;
+  const { focusContext } = props;
+  useLayoutEffect(() => {
+    const element = scrollRef.current;
+    if (!focusContext || !element) return;
+    let focused = false;
+    const focus = () => {
+      focused = true;
+      setContext(focusContext, true);
+    };
+    const blur = () => {
+      if (!focused) return;
+      focused = false;
+      setContext(focusContext, false);
+    };
+    element.addEventListener("focus", focus);
+    element.addEventListener("blur", blur);
+    if (element.ownerDocument.activeElement === element) focus();
+    return () => {
+      element.removeEventListener("focus", focus);
+      element.removeEventListener("blur", blur);
+      // Removing a focused tree can skip blur, leaving its shortcuts active.
+      blur();
+    };
+  }, [emptyState, focusContext]);
+
+  if (emptyState) return <div className={clsx(styles.tree, styles.emptyWrap, className)}>{empty}</div>;
 
   return (
     <div className={clsx(styles.wrap, className)}>
       <div
         ref={scrollRef}
         role="tree"
-        aria-label={tx(props["aria-label"])}
+        aria-label={given(props["aria-label"])}
         aria-multiselectable={multiSelect || undefined}
         aria-activedescendant={
           leadRow && !leadRow.loading && virtualizer.getVirtualItems().some((v) => v.index === leadIndex)
@@ -498,16 +656,22 @@ export function Tree<T>(props: TreeProps<T>) {
         }
       >
         <div className={styles.sizer} style={{ height: virtualizer.getTotalSize() }}>
+          {props.horizontalScroll && (
+            <div aria-hidden data-content-width className={styles.contentWidth} style={{ width: contentWidth }} />
+          )}
           {virtualizer.getVirtualItems().map((v) => {
             const row = rows[v.index]!;
-            const pad = 4 + row.depth * indent;
-            const style = { transform: `translateY(${v.start}px)`, height: v.size, paddingLeft: pad };
+            // Settings › Appearance › "Use smaller indents in trees" sets `--tree-indent`
+            // on the root; reading it here applies the setting to every tree at once,
+            // instantly, and keeps chevrons and level alignment consistent with it.
+            const pad = (extra = 0) => `calc(${4 + extra}px + ${row.depth} * var(--tree-indent, ${indent}px))`;
+            const style = { transform: `translateY(${v.start}px)`, height: v.size, paddingLeft: pad() };
             if (row.loading) {
               return (
                 <div
                   key={v.key}
                   className={clsx(styles.row, styles.loading)}
-                  style={{ ...style, paddingLeft: pad + 20 }}
+                  style={{ ...style, paddingLeft: pad(20) }}
                   role="presentation"
                 >
                   <Spinner size={12} /> <T>Loading…</T>
@@ -515,6 +679,10 @@ export function Tree<T>(props: TreeProps<T>) {
               );
             }
             const isSelected = selected.has(row.key);
+            const prevRow = rows[v.index - 1];
+            const nextRow = rows[v.index + 1];
+            const joinPrev = isSelected && !!prevRow && !prevRow.loading && selected.has(prevRow.key);
+            const joinNext = isSelected && !!nextRow && !nextRow.loading && selected.has(nextRow.key);
             const isLead = v.index === leadIndex;
             const matches = matchMap.get(row.key) ?? null;
             const state: TreeRowState = {
@@ -541,16 +709,24 @@ export function Tree<T>(props: TreeProps<T>) {
                 aria-selected={isSelected}
                 className={clsx(
                   styles.row,
+                  props.horizontalScroll && styles.wideRow,
                   rowClassName?.(row.node),
                   isSelected && styles.selected,
+                  joinPrev && styles.joinPrev,
+                  joinNext && styles.joinNext,
                   isLead && styles.lead,
+                  reordering.drop?.key === row.key && styles[reordering.drop.position],
                 )}
                 style={style}
+                onPointerDown={props.reorder ? (e) => reordering.start(e, row) : undefined}
                 onMouseDown={(e) => onRowMouseDown(e, v.index)}
-                onDoubleClick={(e) => activate(row, e)}
+                onDoubleClick={(e) => {
+                  if (!props.reorder || !reordering.suppressActivation.current) activate(row, e);
+                }}
               >
                 <span
                   className={styles.chevron}
+                  data-tree-toggle
                   onMouseDown={(e) => {
                     if (!row.expandable || e.button !== 0) return;
                     e.stopPropagation();
@@ -574,7 +750,9 @@ export function Tree<T>(props: TreeProps<T>) {
                       indices={matches}
                       tone="accent"
                     />
-                    {detail && <span className={styles.detail}>{detail}</span>}
+                    {detail != null && detail !== false && detail !== "" && (
+                      <span className={styles.detail}>{detail}</span>
+                    )}
                   </>
                 )}
               </div>

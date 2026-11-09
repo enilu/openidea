@@ -23,6 +23,7 @@ export interface DeploymentMappingValid {
 }
 
 export interface DeploymentServerValid {
+  kind: "sftp" | "local";
   id: string;
   name: string;
   sshConfig: string;
@@ -41,7 +42,10 @@ export interface DeploymentSettingsValid {
   exclude: string[];
 }
 
+export type RunTargetKindValid = "ssh" | "docker" | "compose";
+
 export interface RunTargetValid {
+  kind: RunTargetKindValid;
   id: string;
   name: string;
   sshConfig: string;
@@ -50,6 +54,15 @@ export interface RunTargetValid {
   python: string;
   node: string;
   java: string;
+  /** Services tool window Docker connection id; empty = the CLI's daemon. */
+  dockerConnection: string;
+  image: string;
+  composeFiles: string[];
+  service: string;
+  containerRoot: string;
+  ports: string[];
+  runOptions: string;
+  imageUser: boolean;
 }
 
 export interface RemoteSettings {
@@ -70,6 +83,7 @@ export const DEFAULT_SSH_CONFIG: SshConfigValid = {
 };
 
 export const DEFAULT_DEPLOYMENT_SERVER: DeploymentServerValid = {
+  kind: "sftp",
   id: "",
   name: "",
   sshConfig: "",
@@ -89,6 +103,7 @@ export const DEFAULT_DEPLOYMENT: DeploymentSettingsValid = {
 };
 
 export const DEFAULT_RUN_TARGET: RunTargetValid = {
+  kind: "ssh",
   id: "",
   name: "",
   sshConfig: "",
@@ -97,6 +112,14 @@ export const DEFAULT_RUN_TARGET: RunTargetValid = {
   python: "",
   node: "",
   java: "",
+  dockerConnection: "",
+  image: "",
+  composeFiles: [],
+  service: "",
+  containerRoot: "",
+  ports: [],
+  runOptions: "",
+  imageUser: false,
 };
 
 export const DEFAULT_REMOTE: RemoteSettings = {
@@ -157,6 +180,7 @@ export function validateDeployment(raw: unknown): DeploymentSettingsValid {
   const o = obj(raw);
   const d = DEFAULT_DEPLOYMENT;
   const servers = withIds(o.servers, "server", (s) => ({
+    kind: oneOf(s.kind, ["sftp", "local"] as const, "sftp"),
     id: text(s.id, ""),
     name: text(s.name, ""),
     sshConfig: text(s.sshConfig, ""),
@@ -178,6 +202,7 @@ export function validateDeployment(raw: unknown): DeploymentSettingsValid {
 export function validateRunTargets(raw: unknown): RunTargetValid[] {
   const d = DEFAULT_RUN_TARGET;
   return withIds(raw, "target", (o) => ({
+    kind: oneOf(o.kind, ["ssh", "docker", "compose"] as const, d.kind),
     id: text(o.id, ""),
     name: text(o.name, ""),
     sshConfig: text(o.sshConfig, ""),
@@ -186,6 +211,14 @@ export function validateRunTargets(raw: unknown): RunTargetValid[] {
     python: text(o.python, ""),
     node: text(o.node, ""),
     java: text(o.java, ""),
+    dockerConnection: text(o.dockerConnection, ""),
+    image: text(o.image, ""),
+    composeFiles: strings(o.composeFiles, []),
+    service: text(o.service, ""),
+    containerRoot: text(o.containerRoot, ""),
+    ports: strings(o.ports, []),
+    runOptions: text(o.runOptions, ""),
+    imageUser: bool(o.imageUser, d.imageUser),
   }));
 }
 
@@ -208,3 +241,11 @@ export function sshLabel(c: Pick<SshConfigValid, "name" | "host" | "port" | "use
 let seq = 0;
 /** A fresh id for a new SSH configuration, server or target. */
 export const newRemoteId = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${++seq}`;
+
+/** Whether `target` runs configurations in a container (Docker, Compose) rather than over SSH. */
+export const inContainer = (target: { kind: string }) => target.kind === "docker" || target.kind === "compose";
+
+/** Backend connection descriptor for deployment and folder browsing. */
+export function deploymentConnection(server: DeploymentServerValid): { kind: "local" } | { kind: "sftp"; ssh: string } {
+  return server.kind === "local" ? { kind: "local" } : { kind: "sftp", ssh: server.sshConfig };
+}

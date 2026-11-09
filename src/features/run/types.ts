@@ -3,6 +3,7 @@
  * Application, Spring Boot, Compound) and the helpers that turn a type's params into the launched
  * command line. Other features contribute types with `registerRunConfigType`.
  */
+import { isJvmApplication, parseJavaArgs } from "@/platform/javaLaunch";
 import type { RunConfig } from "@/platform/ipc";
 import { registerRunConfigType, useRunConfigTypes, type RunConfigTypeContribution } from "@/workbench/contributions";
 import { formatArgs, parseArgs, uid, uniqueName } from "./configs";
@@ -12,11 +13,20 @@ import {
   gradleForkedJvm,
   isWindows,
   mavenForkedJvm,
+  ROOT_MODULE,
   springBootType,
   type ForkedJvm,
 } from "./jvmTypes";
 import { tx } from "@/platform/i18n";
 import { useProject } from "@/platform/project";
+
+import { tomcatType } from "./tomcat";
+import { goBuildType, goTestType } from "./goTypes";
+
+import { dotnetProjectType, dotnetTestType } from "./dotnetTypes";
+import { rakeType, rspecType, rubyScriptType } from "./rubyTypes";
+import { djangoTestType } from "./djangoTypes";
+import { phpunitType } from "./phpunitTypes";
 
 export const COMPOUND = "compound";
 
@@ -47,12 +57,20 @@ const shell: RunConfigTypeContribution = {
         { value: "command", label: "Command line" },
       ],
     },
-    { key: "path", label: "Script path", mono: true, required: true, visible: (p) => p.mode === "file" },
+    {
+      key: "path",
+      label: "Script path",
+      mono: true,
+      required: true,
+      browse: "file",
+      visible: (p) => p.mode === "file",
+    },
     { key: "options", label: "Script options", mono: true, visible: (p) => p.mode === "file" },
     {
       key: "interpreter",
       label: "Interpreter path",
       mono: true,
+      browse: "file",
       placeholder: "Run the script directly",
       visible: (p) => p.mode === "file",
     },
@@ -107,7 +125,14 @@ const program: RunConfigTypeContribution = {
   icon: "file-binary",
   description: "Run an executable with arguments",
   fields: [
-    { key: "program", label: "Executable", mono: true, required: true, placeholder: "Path or command on PATH" },
+    {
+      key: "program",
+      label: "Executable",
+      mono: true,
+      required: true,
+      browse: "file",
+      placeholder: "Path or command on PATH",
+    },
     { key: "arguments", label: "Program arguments", mono: true },
   ],
   commandLine: (p) => ({ command: p.program ?? "", args: parseArgs(p.arguments ?? "") }),
@@ -130,7 +155,13 @@ const godot: RunConfigTypeContribution = {
   ownsWorkingDirectory: true,
   debugAdapter: "godot",
   fields: [
-    { key: "projectDir", label: "Project directory", mono: true, placeholder: "Project root (holds project.godot)" },
+    {
+      key: "projectDir",
+      label: "Project directory",
+      mono: true,
+      browse: "directory",
+      placeholder: "Project root (holds project.godot)",
+    },
     {
       key: "scene",
       label: "Scene",
@@ -179,7 +210,13 @@ const npm: RunConfigTypeContribution = {
   defaults: { packageManager: "npm", command: "run" },
   ownsWorkingDirectory: true,
   fields: [
-    { key: "packageDir", label: "package.json directory", mono: true, placeholder: "Project root" },
+    {
+      key: "packageDir",
+      label: "package.json directory",
+      mono: true,
+      browse: "directory",
+      placeholder: "Project root",
+    },
     { key: "command", label: "Command", control: "select", options: NPM_COMMANDS.map((v) => ({ value: v, label: v })) },
     {
       key: "script",
@@ -195,6 +232,14 @@ const npm: RunConfigTypeContribution = {
       label: "Package manager",
       control: "select",
       options: PACKAGE_MANAGERS.map((v) => ({ value: v, label: v })),
+    },
+    {
+      key: "nodeInterpreter",
+      label: "Node interpreter",
+      mono: true,
+      browse: "file",
+      placeholder: "Project default",
+      hint: "The node executable this script runs on; empty uses Settings › Languages & Frameworks › Node.js.",
     },
   ],
   commandLine(p) {
@@ -240,7 +285,7 @@ function buildToolType(
     defaults: wrapper.byDefault ? { wrapper: "true" } : {},
     ownsWorkingDirectory: true,
     fields: [
-      { key: "projectDir", label: tx`${label} project`, mono: true, placeholder: "Project root" },
+      { key: "projectDir", label: tx`${label} project`, mono: true, browse: "directory", placeholder: "Project root" },
       {
         key: "tasks",
         label: tasks.label,
@@ -392,8 +437,18 @@ export const BUILTIN_TYPES: readonly RunConfigTypeContribution[] = [
   maven,
   godot,
   pytest,
+  rubyScriptType,
+  rakeType,
+  rspecType,
+  djangoTestType,
+  phpunitType,
+  dotnetProjectType,
+  dotnetTestType,
+  goBuildType,
+  goTestType,
   applicationType,
   springBootType,
+  tomcatType,
   compound,
 ];
 
@@ -415,13 +470,17 @@ export const isDebugOnly = (c: Pick<RunConfig, "kind">, type = typeFor(c.kind)) 
  */
 export function formParams(config: RunConfig, type = typeFor(config.kind)): Record<string, string> | null {
   if (!type) return null;
-  if (config.params && Object.keys(config.params).length) return { ...config.params };
+  if (config.params && Object.keys(config.params).length && (type.id !== "go" || config.params.goKind))
+    return { ...config.params };
   if (type.id === COMPOUND) return {};
+  // No command line to fall back to: the form stays, and an emptied field shows as required.
+  if (type.debugOnly) return { ...config.params };
   const derived = type.paramsFrom?.(config);
   if (!derived) return null;
   // Only when the form reproduces exactly what runs today.
   const line = type.commandLine(derived);
   if (!line) return null;
+  if (type.id === "go") return derived;
   const sameCwd = !type.ownsWorkingDirectory || (line.cwd ?? null) === (config.cwd ?? null);
   return line.command === config.command && formatArgs(line.args) === formatArgs(config.args) && sameCwd
     ? derived
@@ -435,9 +494,26 @@ export function withParams(config: RunConfig, params: Record<string, string>, ty
   if (!line) return { ...rest, params, command: "", args: [] };
   return {
     ...rest,
-    params,
+    ...(config.kind === "dotnet" && config.beforeLaunch === undefined
+      ? { beforeLaunch: [{ kind: "dotnetBuild", target: "" }] }
+      : {}),
+    ...(config.kind === "dotnet-test" ||
+    config.kind === "django-test" ||
+    config.kind === "phpunit" ||
+    config.kind === "rspec"
+      ? { isTest: true }
+      : {}),
+    params: params.goKind ? { ...params, programArgv: JSON.stringify(parseArgs(params.programArgs ?? "")) } : params,
+    ...(config.kind === "go-test" && !config.id.startsWith("template:") ? { kind: "go" } : {}),
+    ...(params.goKind ? { isTest: params.goKind === "test" } : {}),
     command: line.command,
     args: line.args,
+    // "Use classpath of module": the chosen module; else it is found again for another main class.
+    ...(isJvmApplication(config) && params.module
+      ? { module: params.module === ROOT_MODULE ? "" : params.module }
+      : isJvmApplication(config) && parseJavaArgs(config.args).mainClass !== parseJavaArgs(line.args).mainClass
+        ? { module: undefined }
+        : {}),
     ...(type?.ownsWorkingDirectory ? { cwd: line.cwd ?? null } : {}),
     ...(line.stop ? { stopCommand: line.stop } : {}),
   };

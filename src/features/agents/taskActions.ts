@@ -3,10 +3,24 @@ import type { Action } from "@/platform/actions";
 import { tx } from "@/platform/i18n";
 import type { MenuItem } from "@/ui";
 import { showError, confirmChecked } from "@/workbench/messages";
+import { promptInput } from "@/workbench/inputDialogs";
 import { isBusy } from "./model";
-import { archiveTask, unarchiveTask, deleteTask, openTask, useAgents } from "./store";
+import {
+  archiveTask,
+  unarchiveTask,
+  deleteTask,
+  dockTask,
+  forkTask,
+  openTask,
+  openTaskInEditorLocation,
+  renameTask,
+  setSessionLocation,
+  undockTask,
+  useAgents,
+} from "./store";
 
 const canArchive = (task: AgentTask) => !isBusy(task.status) && task.status !== "archived";
+const canFork = (task: AgentTask) => canArchive(task) && !!task.capabilities?.fork;
 
 function resolveTasks(arg: unknown): AgentTask[] {
   if (!Array.isArray(arg)) return [];
@@ -59,12 +73,80 @@ async function confirmDelete(tasks: AgentTask[]) {
 
 export const taskActions: Action[] = [
   {
+    id: "agents.useToolWindow",
+    title: "Chat in Tool Window",
+    category: "Agents",
+    icon: "open-in-tool-window",
+    run: () => setSessionLocation("toolWindow"),
+  },
+  {
+    id: "agents.useEditor",
+    title: "Chat in Editor",
+    category: "Agents",
+    icon: "editor-only",
+    run: () => setSessionLocation("editor"),
+  },
+  {
+    id: "agents.openTaskInEditor",
+    title: "Open Agent Task in Editor",
+    category: "Agents",
+    hidden: true,
+    run: ({ arg }) => {
+      if (typeof arg === "string") openTaskInEditorLocation(arg);
+    },
+  },
+  {
     id: "agents.openTask",
     title: "Open Agent Task",
     category: "Agents",
     hidden: true,
     run: ({ arg }) => {
       if (typeof arg === "string") openTask(arg);
+    },
+  },
+  {
+    id: "agents.dockTask",
+    title: "Open Agent Task in Tool Window",
+    category: "Agents",
+    hidden: true,
+    run: ({ arg }) => {
+      if (typeof arg === "string") dockTask(arg);
+    },
+  },
+  {
+    id: "agents.undockTask",
+    title: "Open Agent Task in Editor",
+    category: "Agents",
+    hidden: true,
+    run: () => undockTask(),
+  },
+  {
+    id: "agents.renameTask",
+    title: "Rename Agent Task",
+    category: "Agents",
+    hidden: true,
+    run: async ({ arg }) => {
+      const task = resolveTasks([arg])[0];
+      if (!task) return;
+      const title = await promptInput({
+        title: "Rename Agent Task",
+        label: "Name",
+        initial: task.title,
+        okLabel: "Rename",
+      });
+      if (title !== null)
+        await renameTask(task.id, title).catch((e: unknown) => showError(tx("Couldn't rename the task"), String(e)));
+    },
+  },
+  {
+    id: "agents.forkTask",
+    title: "Copy Agent Task to a New Task",
+    category: "Agents",
+    hidden: true,
+    run: ({ arg }) => {
+      const task = resolveTasks([arg])[0];
+      if (task && canFork(task))
+        return forkTask(task.id, null).catch((e: unknown) => showError(tx("Couldn't copy the task"), String(e)));
     },
   },
   {
@@ -107,7 +189,20 @@ export function taskMenu(tasks: AgentTask[]): MenuItem[] {
     ...(!multiple
       ? ([
           { kind: "action", action: "agents.openTask", label: "Open", arg: task.id },
+          { kind: "action", action: "agents.renameTask", label: "Rename…", icon: "edit", arg: task.id },
           { kind: "action", action: "terminal.openAt", label: "Open in Terminal", icon: "terminal", arg: task.cwd },
+          ...(task.capabilities?.fork && task.status !== "archived"
+            ? ([
+                {
+                  kind: "action",
+                  action: "agents.forkTask",
+                  label: "Copy to a New Task",
+                  icon: "branch",
+                  arg: task.id,
+                  disabled: !canFork(task),
+                },
+              ] satisfies MenuItem[])
+            : []),
           { kind: "separator" },
         ] satisfies MenuItem[])
       : []),

@@ -1,3 +1,4 @@
+import { formatArgs } from "@/platform/commandLine";
 /** Run configuration helpers: grouping, overriding, validation and argument parsing. */
 import type { RunConfig } from "@/platform/ipc";
 import { useRunConfigTypes } from "@/workbench/contributions";
@@ -12,7 +13,10 @@ const KIND_LABELS: Record<string, string> = {
   go: "Go",
   python: "Python",
   pytest: "pytest",
+  phpunit: "PHPUnit",
+  composer: "Composer",
   make: "Make",
+  cmake: "CMake",
   just: "Just",
   shell: "Shell Script",
   program: "Program",
@@ -25,6 +29,7 @@ const KIND_LABELS: Record<string, string> = {
   kotlinc: "Kotlin Single File",
   cc: "C/C++ Single File",
   native: "Native Executable",
+  "cmake-application": "CMake Application",
   ruby: "Ruby",
   php: "PHP",
   perl: "Perl",
@@ -38,13 +43,61 @@ const KIND_LABELS: Record<string, string> = {
 };
 
 export const KIND_OPTIONS = Object.entries(KIND_LABELS).map(([value, label]) => ({ value, label }));
+/**
+ * The menu category of a run configuration kind, for the Services "Add Service"
+ * menu (IDEA's template groups): a registered type's group (Docker, Servers),
+ * else its language/tool category, else "Others".
+ */
+export const KIND_CATEGORIES: Record<string, string> = {
+  "spring-boot": "Java",
+  application: "Java",
+  native: "Java",
+  "java-file": "Java",
+  kotlin: "Java",
+  kotlinc: "Java",
+  "scala-cli": "Java",
+  maven: "Build Tools",
+  gradle: "Build Tools",
+  cmake: "Build Tools",
+  make: "Build Tools",
+  just: "Build Tools",
+  npm: "JavaScript",
+  vue: "JavaScript",
+  node: "JavaScript",
+  bun: "JavaScript",
+  deno: "JavaScript",
+  python: "Python",
+  pytest: "Python",
+  cargo: "Rust",
+  rustc: "Rust",
+  go: "Go",
+  cc: "C/C++",
+  "cmake-application": "C/C++",
+  shell: "Shell",
+  program: "Shell",
+};
+
+/** Category order of the Add Service menu; unlisted categories (plugins) sort after, then "Others". */
+export const CATEGORY_ORDER: readonly string[] = [
+  "Java",
+  "Build Tools",
+  "JavaScript",
+  "Python",
+  "Rust",
+  "Go",
+  "C/C++",
+  "Shell",
+  "Servers",
+  "Docker",
+];
+
+export function categoryOf(kind: string): string {
+  return useRunConfigTypes.getState().types.get(kind)?.group ?? KIND_CATEGORIES[kind] ?? "Others";
+}
 
 export function kindLabel(kind: string): string {
-  return (
-    useRunConfigTypes.getState().types.get(kind)?.label ??
-    KIND_LABELS[kind] ??
-    (kind ? kind[0]!.toUpperCase() + kind.slice(1) : "Other")
-  );
+  const type = useRunConfigTypes.getState().types.get(kind);
+  return type?.label ?? KIND_LABELS[kind] ?? (kind ? kind[0]!.toUpperCase() + kind.slice(1) : "Other");
 }
 
 export function configIcon(config: Pick<RunConfig, "kind" | "isTest">): string {
@@ -56,6 +109,8 @@ export function configIcon(config: Pick<RunConfig, "kind" | "isTest">): string {
       return "file-binary";
     case "spring-boot":
       return "spring-boot";
+    case "tomcat":
+      return "tomcat";
     case "npm":
     case "bun":
       return "file-npm";
@@ -67,6 +122,9 @@ export function configIcon(config: Pick<RunConfig, "kind" | "isTest">): string {
       return "file-gradle";
     case "maven":
       return "file-maven";
+    case "dotnet":
+    case "dotnet-test":
+      return "file-csharp";
     case "go":
       return "file-go";
     case "node":
@@ -78,6 +136,7 @@ export function configIcon(config: Pick<RunConfig, "kind" | "isTest">): string {
     case "rustc":
       return "file-rust";
     case "cc":
+    case "cmake-application":
       return "file-cpp";
     case "shell":
       return "file-shell";
@@ -108,6 +167,9 @@ export function configIcon(config: Pick<RunConfig, "kind" | "isTest">): string {
     case "python":
     case "pytest":
       return "file-python";
+    case "phpunit":
+    case "composer":
+      return "file-php";
     default:
       return useRunConfigTypes.getState().types.get(config.kind)?.icon ?? "terminal";
   }
@@ -204,6 +266,12 @@ export function duplicateConfig(config: RunConfig, configs: readonly RunConfig[]
 /** Field errors: `name`, `command`, `env`, `cwd`, `compound`, `beforeLaunch` or a type param key. */
 export type ConfigErrors = Partial<Record<string, string>>;
 
+export function moduleTaskError(config: RunConfig, target: string): string | null {
+  if (config.module == null) return "Select a module for the Build Module task";
+  if (config.module !== target) return "The Build Module task uses a different module; remove it and add it again";
+  return null;
+}
+
 export function validateConfig(config: RunConfig, all: readonly RunConfig[] = []): ConfigErrors {
   const errors: ConfigErrors = {};
   if (!config.name.trim()) errors.name = "Name is required";
@@ -218,9 +286,21 @@ export function validateConfig(config: RunConfig, all: readonly RunConfig[] = []
   } else if (!config.command.trim() && !useRunConfigTypes.getState().types.get(config.kind)?.debugOnly)
     errors.command = "Command is required";
   for (const t of config.beforeLaunch ?? []) {
-    if (t.kind === "run" && (t.target === config.id || !all.some((c) => c.id === t.target)))
+    if (
+      (t.kind === "run" || (t.kind === "build" && t.target)) &&
+      (t.target === config.id || !all.some((c) => c.id === t.target))
+    )
       errors.beforeLaunch = "A before launch task runs a missing configuration or this one";
-    else if (t.kind !== "build" && t.kind !== "run" && !(t.target ?? "").trim())
+    else if (t.kind === "buildModule") {
+      const error = moduleTaskError(config, t.target ?? "");
+      if (error) errors.beforeLaunch = error;
+    } else if (
+      t.kind !== "build" &&
+      t.kind !== "buildArtifacts" &&
+      t.kind !== "dotnetBuild" &&
+      t.kind !== "run" &&
+      !(t.target ?? "").trim()
+    )
       errors.beforeLaunch = "A before launch task is incomplete";
   }
   for (const key of Object.keys(config.env)) {
@@ -239,49 +319,7 @@ export function validateConfig(config: RunConfig, all: readonly RunConfig[] = []
 
 export const hasErrors = (e: ConfigErrors) => Object.keys(e).length > 0;
 
-/**
- * Splits a command line into arguments: whitespace, '…' and "…" quoting, backslash escapes.
- * `windowsPaths`: a backslash only escapes a quote, so `C:\dir\app.jar` stays as typed.
- */
-export function parseArgs(input: string, windowsPaths = false): string[] {
-  const out: string[] = [];
-  let cur = "";
-  let has = false;
-  let quote: "'" | '"' | null = null;
-  for (let i = 0; i < input.length; i++) {
-    const ch = input[i]!;
-    if (quote) {
-      if (ch === quote) quote = null;
-      else if (
-        ch === "\\" &&
-        quote === '"' &&
-        i + 1 < input.length &&
-        (windowsPaths ? '"' : '"\\$`').includes(input[i + 1]!)
-      )
-        cur += input[++i];
-      else cur += ch;
-    } else if (ch === "'" || ch === '"') {
-      quote = ch;
-      has = true;
-    } else if (ch === "\\" && i + 1 < input.length && (!windowsPaths || "\"'".includes(input[i + 1]!))) {
-      cur += input[++i];
-      has = true;
-    } else if (/\s/.test(ch)) {
-      if (has || cur) out.push(cur);
-      cur = "";
-      has = false;
-    } else {
-      cur += ch;
-    }
-  }
-  if (has || cur) out.push(cur);
-  return out;
-}
-
-/** Inverse of `parseArgs` (quotes only when needed). */
-export function formatArgs(args: readonly string[]): string {
-  return args.map((a) => (a === "" ? "''" : /[\s'"\\$`]/.test(a) ? `'${a.replace(/'/g, `'\\''`)}'` : a)).join(" ");
-}
+export { parseArgs, formatArgs } from "@/platform/commandLine";
 
 /** Display command line, e.g. `pnpm run dev`. */
 export function commandLine(config: Pick<RunConfig, "command" | "args">): string {

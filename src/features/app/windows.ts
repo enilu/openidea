@@ -7,9 +7,9 @@
  * Open File…, a file path on the command line) open in LightEdit: a window with
  * editor tabs only. One LightEdit window collects them all.
  */
-import type { Action } from "@/platform/actions";
+import { executeAction, type Action } from "@/platform/actions";
 import { t } from "@/platform/i18n";
-import { call, commands, isTauri } from "@/platform/ipc";
+import { call, commands, isCancelled, isTauri } from "@/platform/ipc";
 import {
   basename,
   confirmLeaveProject,
@@ -23,6 +23,8 @@ import { connectRemote, isRemoteWindow } from "@/platform/remote";
 import { holdSplash } from "@/platform/splash";
 import { editorService, maybeEditorService, notifications } from "@/workbench/contributions";
 import { chooseProjectWindow } from "@/workbench/projectWindow";
+import { cycleWindowTab, useWindowGroup } from "@/platform/windowGroups";
+import { showWorkspaceDialog } from "./WorkspaceDialog";
 
 export const LAUNCH_EVENT = "openidea://launch";
 
@@ -37,6 +39,7 @@ function desktopOnly(): boolean {
 }
 
 function openFailed(path: string, e: unknown) {
+  if (isCancelled(e)) return;
   notifications().notify({
     level: "error",
     title: t("app.window.openFailed", { name: basename(path) }),
@@ -47,27 +50,39 @@ function openFailed(path: string, e: unknown) {
 
 /** Opens project `path` in this window; true once it is this window's project. */
 async function openHere(path: string): Promise<boolean> {
-  if (useProject.getState().project?.root === path) return true;
+  if (!isRemoteWindow() && useProject.getState().project?.root === path) return true;
   if (!(await confirmLeaveProject())) return false;
   try {
-    await openProject(path);
+    // A folder of a WSL distro runs there, not as a network folder.
+    const wsl = await commands.wslResolve(path).catch(() => null);
+    if (wsl) await connectRemote(wsl.target, wsl.path);
+    else await openProject(path);
     return true;
   } catch (e) {
+    maybeEditorService()?.cancelClose?.();
     openFailed(path, e);
     return false;
   }
 }
 
 /** Opens `files` as editor tabs of this window, focusing the last. */
-async function openInEditor(files: readonly string[]): Promise<void> {
-  for (const [i, path] of files.entries())
+/** Caret positions of files opened from the command line (`--line` / `--column`), 0-based. */
+type Positions = ReadonlyArray<{ path: string; line: number; column: number }>;
+
+async function openInEditor(files: readonly string[], positions: Positions = []): Promise<void> {
+  for (const [i, path] of files.entries()) {
+    const at = positions.find((p) => p.path === path);
     await editorService()
-      .openFile(path, { focus: i === files.length - 1 })
+      .openFile(path, {
+        focus: i === files.length - 1,
+        ...(at ? { selection: { line: at.line, col: at.column } } : {}),
+      })
       .catch((e) => console.warn(`could not open ${path}`, e));
+  }
 }
 
 /** Opens `files` in this window: in its project's editor or, without one, in LightEdit. */
-async function openFilesHere(files: readonly string[]): Promise<void> {
+async function openFilesHere(files: readonly string[], positions: Positions = []): Promise<void> {
   const s = useProject.getState();
   if (!s.project && !s.lightEdit) {
     try {
@@ -76,7 +91,7 @@ async function openFilesHere(files: readonly string[]): Promise<void> {
       return openFailed(files[0]!, e);
     }
   }
-  await openInEditor(files);
+  await openInEditor(files, positions);
 }
 
 /**
@@ -136,10 +151,33 @@ export async function openProjectWithPolicy(path: string, files: readonly string
   if (desktopOnly()) return;
   const { project: current, lightEdit } = useProject.getState();
   if (!current && !lightEdit) return openProjectInWindow(path, false, files);
-  if (current?.root === path) return openInEditor(files);
+  if (!isRemoteWindow() && current?.root === path) return openInEditor(files);
+  if (!isRemoteWindow() && current?.workspace?.projects.includes(path)) {
+    await executeAction("project.reveal", path);
+    return openInEditor(files);
+  }
   const mode = await chooseProjectWindow(basename(path));
   if (!mode) return;
   if (mode === "new") return openProjectInWindow(path, true, files);
+  if (mode === "attach") {
+    try {
+      if (!current?.workspace && !(await confirmLeaveProject())) return;
+      const root = await call(commands.workspaceAttach(path));
+      if (root === current?.root) {
+        if (!current.workspace) maybeEditorService()?.cancelClose?.();
+        const project = await commands.projectCurrent();
+        if (project) useProject.setState({ project, settings: project.settings });
+      } else {
+        await openProject(root);
+      }
+      await executeAction("project.reveal", path);
+      await openInEditor(files);
+    } catch (e) {
+      maybeEditorService()?.cancelClose?.();
+      openFailed(path, e);
+    }
+    return;
+  }
   try {
     // A window that already has the project is focused instead.
     const outcome = await call(commands.windowOpenProject(path, false, [...files]));
@@ -174,17 +212,19 @@ async function pickFiles(title: string): Promise<string[]> {
   return picked === null ? [] : Array.isArray(picked) ? picked : [picked];
 }
 
-/** Takes this window's pending launch (if any) and opens its project and files. */
+/** Takes this window's pending launch (if any) and opens its project, files or diff pair. */
 export async function consumeLaunch(): Promise<void> {
   if (!isTauri()) return;
   const launch = await commands.windowTakeLaunch().catch(() => null);
   const files = launch?.files ?? [];
+  const positions = launch?.positions ?? [];
   if (launch?.project) {
-    if (await openHere(launch.project)) await openInEditor(files);
-  } else if (files.length) await openFilesHere(files);
+    if (await openHere(launch.project)) await openInEditor(files, positions);
+  } else if (files.length) await openFilesHere(files, positions);
+  else if (launch?.diff) await openCliDiff(launch.diff);
   else if (launch?.remote) {
-    const { sshConfig, path } = launch.remote;
-    await connectRemote(sshConfig, path).catch((e) =>
+    const { target, path } = launch.remote;
+    await connectRemote(target, path).catch((e) =>
       notifications().notify({
         level: "error",
         title: t("app.window.openFailed", { name: basename(path) }),
@@ -195,8 +235,158 @@ export async function consumeLaunch(): Promise<void> {
   }
 }
 
+/**
+ * `openidea diff a.txt b.txt`: the two files side by side in the diff viewer (both editable).
+ * Without a project or LightEdit session the right file opens one first, like a launched file does.
+ */
+async function openCliDiff(diff: { left: string; right: string }): Promise<void> {
+  const s = useProject.getState();
+  if (!s.project && !s.lightEdit) await openLightEdit(diff.right).catch(() => {});
+  const [{ openVcsDiff }, { compareFilesData }] = await Promise.all([
+    import("@/features/vcs/diffInput"),
+    import("@/features/vcs/compareData"),
+  ]);
+  await openVcsDiff(compareFilesData(diff.left, diff.right));
+}
+
+/** Closes the project tabs on `side` of the `arg` tab (default: the current one), keeping that tab. */
+function closeProjectTabs(side: "others" | "left" | "right"): Action["run"] {
+  return async ({ arg }) => {
+    const tabs = useWindowGroup.getState().tabs;
+    const keep = typeof arg === "string" ? arg : tabs.find((tab) => tab.current)?.label;
+    const index = tabs.findIndex((tab) => tab.label === keep);
+    if (!keep || index < 0) return;
+    const labels = tabs
+      .filter((_, i) => (side === "left" ? i < index : side === "right" ? i > index : i !== index))
+      .map((tab) => tab.label);
+    if (labels.length) await call(commands.windowGroupCloseTabs(keep, labels));
+  };
+}
+
 export function windowActions(): Action[] {
   return [
+    {
+      id: "workspace.removeProject",
+      title: "Remove from Workspace",
+      category: t("app.category.file"),
+      when: "workspaceOpen",
+      run: async ({ arg }) => {
+        const workspace = useProject.getState().project?.workspace;
+        if (typeof arg !== "string" || !workspace || !workspace.projects.includes(arg)) return;
+        const project = await call(
+          commands.workspaceUpdate(
+            workspace.name,
+            workspace.projects.filter((p) => p !== arg),
+          ),
+        );
+        useProject.setState({ project, settings: project.settings });
+      },
+    },
+    {
+      id: "workspace.create",
+      title: "New Workspace…",
+      category: t("app.category.file"),
+      icon: "folder",
+      run: () => {
+        if (!desktopOnly()) showWorkspaceDialog("create");
+      },
+    },
+    {
+      id: "workspace.open",
+      title: "Open Workspace…",
+      category: t("app.category.file"),
+      icon: "folder-open",
+      run: async () => {
+        if (desktopOnly()) return;
+        const path = await pickFolder("Open Workspace");
+        if (path) await openProjectWithPolicy(path);
+      },
+    },
+    {
+      id: "workspace.manage",
+      title: "Manage Workspace…",
+      category: t("app.category.file"),
+      when: "workspaceOpen",
+      run: () => showWorkspaceDialog("manage"),
+    },
+    {
+      id: "window.mergeAllWindows",
+      title: "Merge All Project Windows",
+      category: t("app.category.window"),
+      when: "projectOpen",
+      run: async () => {
+        if (!desktopOnly()) await call(commands.windowGroupMerge());
+      },
+    },
+    {
+      id: "window.detachTab",
+      title: "Move Tab to New Window",
+      category: t("app.category.window"),
+      when: "windowGrouped",
+      run: () => call(commands.windowGroupDetach()),
+    },
+    {
+      id: "window.selectTab",
+      title: "Select Project Tab",
+      hidden: true,
+      when: "windowGrouped",
+      run: async ({ arg }) => {
+        if (typeof arg === "string") await call(commands.windowGroupSelect(arg));
+      },
+    },
+    {
+      id: "window.closeTab",
+      title: "Close Project Tab",
+      hidden: true,
+      when: "windowGrouped",
+      run: async ({ arg }) => {
+        if (typeof arg === "string") await call(commands.windowGroupClose(arg));
+      },
+    },
+    {
+      id: "window.closeOtherTabs",
+      title: "Close Other Project Tabs",
+      category: t("app.category.window"),
+      when: "windowGrouped",
+      run: closeProjectTabs("others"),
+    },
+    {
+      id: "window.closeTabsToLeft",
+      title: "Close Project Tabs to the Left",
+      category: t("app.category.window"),
+      when: "windowGrouped",
+      run: closeProjectTabs("left"),
+    },
+    {
+      id: "window.closeTabsToRight",
+      title: "Close Project Tabs to the Right",
+      category: t("app.category.window"),
+      when: "windowGrouped",
+      run: closeProjectTabs("right"),
+    },
+    {
+      id: "window.reorderTabs",
+      title: "Reorder Project Tabs",
+      hidden: true,
+      when: "windowGrouped",
+      run: async ({ arg }) => {
+        if (Array.isArray(arg) && arg.every((v) => typeof v === "string")) await call(commands.windowGroupReorder(arg));
+      },
+    },
+    {
+      id: "window.nextTab",
+      title: "Next Project Tab",
+      category: t("app.category.window"),
+      when: "windowGrouped",
+      run: () => cycleWindowTab(true),
+    },
+    {
+      id: "window.previousTab",
+      title: "Previous Project Tab",
+      category: t("app.category.window"),
+      when: "windowGrouped",
+      run: () => cycleWindowTab(false),
+    },
     {
       id: "file.openInNewWindow",
       title: t("app.action.openInNewWindow"),
@@ -255,7 +445,15 @@ export function windowActions(): Action[] {
       category: t("app.category.file"),
       hidden: true,
       run: async (c) => {
-        if (typeof c.arg === "string") await openProjectWithPolicy(c.arg);
+        if (typeof c.arg === "string") return openProjectWithPolicy(c.arg);
+        const arg = c.arg as { path?: unknown; newWindow?: unknown } | null;
+        if (!arg || typeof arg.path !== "string" || typeof arg.newWindow !== "boolean") return;
+        try {
+          const outcome = await call(commands.windowOpenProject(arg.path, arg.newWindow, []));
+          if (outcome.kind === "current") await openHere(arg.path);
+        } catch (error) {
+          openFailed(arg.path, error);
+        }
       },
     },
     {

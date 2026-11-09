@@ -5,6 +5,7 @@
  */
 import {
   createContext,
+  useCallback,
   useContext,
   useEffect,
   useLayoutEffect,
@@ -20,10 +21,10 @@ import { Icon, type IconName } from "./icons";
 import { IconButton } from "./Button";
 import { Menu, type MenuItem } from "./Menu";
 import { tooltipAttrs } from "./Tooltip";
-import { registerDropTarget, startPointerDrag } from "./pointerDrag";
-import { T } from "./T";
+import { isOutsideWindow, registerDropTarget, startPointerDrag } from "./pointerDrag";
+import { Given } from "./T";
 import styles from "./Tabs.module.css";
-import { tx } from "@/platform/i18n";
+import { tx, useGivenTx } from "@/platform/i18n";
 
 export interface TabItem {
   id: string;
@@ -53,15 +54,42 @@ export interface TabsDnd {
   type: string;
   payload: (id: string) => string;
   onDrop: (payload: string, index: number) => void;
+  /**
+   * A dragged tab released with no accepting target (the pointer left the
+   * window): the editor uses it to detach the tab into a new window. Gets the
+   * dragged tab's payload and the release point in client coordinates.
+   */
+  onDropOutside?: (payload: string, x: number, y: number) => void;
 }
 
-/** Insertion index for a drop at `x` given the tabs' horizontal extents. Exported for tests. */
-export function dropIndex(x: number, rects: ReadonlyArray<{ left: number; width: number }>): number {
+/**
+ * Insertion index for a drop at (`x`, `y`) given the tabs' extents in reading
+ * order, possibly wrapped into rows. Exported for tests.
+ */
+export function dropIndex(
+  x: number,
+  y: number,
+  rects: ReadonlyArray<{ left: number; top: number; width: number; height: number }>,
+): number {
+  const first = rects[0];
+  const last = rects[rects.length - 1];
+  if (!first || !last) return 0;
+  // Above or below the tabs counts as their first or last row.
+  const py = Math.max(first.top, Math.min(y, last.top + last.height - 1));
   for (let i = 0; i < rects.length; i++) {
     const r = rects[i]!;
-    if (x < r.left + r.width / 2) return i;
+    if (py < r.top || (py < r.top + r.height && x < r.left + r.width / 2)) return i;
   }
   return rects.length;
+}
+
+/** Display position of each id with `id` moved to insertion `index` (as passed to `onDrop`). */
+function previewOrder(ids: readonly string[], id: string, index: number): Map<string, number> | null {
+  const from = ids.indexOf(id);
+  if (from < 0) return null;
+  const order = ids.filter((it) => it !== id);
+  order.splice(index > from ? index - 1 : index, 0, id);
+  return new Map(order.map((it, i) => [it, i]));
 }
 
 /** A tab strip as seen from its container: close the selected tab if it can be closed. */
@@ -82,6 +110,8 @@ export interface TabsProps {
   onClose?: (id: string) => void;
   /** Alt+click on a close button (IDEA: close all other tabs). */
   onCloseOthers?: (id: string) => void;
+  /** Shift+left-click a tab closes it (editor tabs; plain clicks still select). */
+  closeOnShiftClick?: boolean;
   onDoubleClick?: (id: string) => void;
   onContextMenu?: (id: string, e: MouseEvent) => void;
   /** `editor`: 30px with separators (editor tabs); `compact`: 28px plain (popups, tool window sub-tabs). */
@@ -108,6 +138,7 @@ export function Tabs({
   onSelect,
   onClose,
   onCloseOthers,
+  closeOnShiftClick,
   onDoubleClick,
   onContextMenu,
   variant = "editor",
@@ -121,6 +152,7 @@ export function Tabs({
   ...aria
 }: TabsProps) {
   const vertical = orientation === "vertical";
+  const given = useGivenTx();
   const scrollRef = useRef<HTMLDivElement>(null);
   const tabRefs = useRef(new Map<string, HTMLButtonElement>());
   const [overflow, setOverflow] = useState(false);
@@ -154,19 +186,23 @@ export function Tabs({
   useLayoutEffect(() => {
     dropState.current = { items, dnd, vertical };
   });
+  // Set when the drag starts, before the strip re-renders for the first `over`.
+  const draggingRef = useRef<string | null>(null);
   const dndType = dnd?.type;
   useEffect(() => {
     const el = stripRef.current;
     if (!el || !dndType) return;
     const indexAt = (x: number, y: number) => {
       const { items, vertical } = dropState.current;
-      return dropIndex(
-        vertical ? y : x,
-        items.map((it) => {
-          const r = tabRefs.current.get(it.id)?.parentElement?.getBoundingClientRect();
-          return vertical ? { left: r?.top ?? 0, width: r?.height ?? 0 } : { left: r?.left ?? 0, width: r?.width ?? 0 };
-        }),
-      );
+      // A tab of this strip is placed among the others as they are laid out now, around its slot.
+      const others = items.filter((it) => it.id !== draggingRef.current);
+      const rects = others.map((it) => {
+        const r = tabRefs.current.get(it.id)?.parentElement?.getBoundingClientRect();
+        const box = { left: r?.left ?? 0, top: r?.top ?? 0, width: r?.width ?? 0, height: r?.height ?? 0 };
+        return vertical ? { left: box.top, top: box.left, width: box.height, height: box.width } : box;
+      });
+      const next = others[vertical ? dropIndex(y, x, rects) : dropIndex(x, y, rects)];
+      return next ? items.indexOf(next) : items.length;
     };
     return registerDropTarget(el, {
       accepts: (type) => type === dropState.current.dnd?.type,
@@ -179,24 +215,64 @@ export function Tabs({
     });
   }, [dndType]);
 
+  // Tab slots wholly in view as last observed, which needs no layout read: switching to one of
+  // them doesn't measure the strip (a forced layout of the window, mid-switch).
+  const inView = useRef(new Set<Element>());
+  // Bring a tab's whole slot (label + close button) into view. Narrowing the strip clips
+  // the active tab's close button (#1740), and clicking the already-active tab doesn't
+  // change `activeId`, so the strip must also reveal on clicks and resizes.
+  const revealTab = useCallback(
+    (id: string | null, always = false) => {
+      const scroller = scrollRef.current;
+      const tab = id ? tabRefs.current.get(id)?.parentElement : null;
+      if (!scroller || !tab || (!always && inView.current.has(tab))) return;
+      (vertical ? revealVertically : revealHorizontally)(scroller, tab);
+    },
+    [vertical],
+  );
+
+  const tabIds = items.map((it) => it.id).join("\n");
+  useEffect(() => {
+    const root = scrollRef.current;
+    if (!root || typeof IntersectionObserver === "undefined") return;
+    const seen = inView.current;
+    const io = new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) {
+          if (e.intersectionRatio >= 1) seen.add(e.target);
+          else seen.delete(e.target);
+        }
+      },
+      { root, threshold: 1 },
+    );
+    for (const tab of tabRefs.current.values()) if (tab.parentElement) io.observe(tab.parentElement);
+    return () => {
+      io.disconnect();
+      seen.clear();
+    };
+  }, [tabIds]);
+
   useLayoutEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     // A vertical strip shows its scrollbar instead of the overflow dropdown.
-    const measure = () => setOverflow(!vertical && el.scrollWidth > el.clientWidth + 1);
+    const measure = () => {
+      setOverflow(!vertical && el.scrollWidth > el.clientWidth + 1);
+      // A resize (e.g. the editor area narrowing) must scroll the active tab back
+      // into view instead of leaving its close button clipped until a tab switch.
+      revealTab(latest.current.activeId, true);
+    };
     measure();
     if (typeof ResizeObserver === "undefined") return;
     const ro = new ResizeObserver(measure);
     ro.observe(el);
     return () => ro.disconnect();
-  }, [items.length, vertical]);
+  }, [items.length, revealTab, vertical]);
 
   useEffect(() => {
     // The whole tab (label + close button) into view, without scrolling any outer container.
-    const tab = activeId ? tabRefs.current.get(activeId)?.parentElement : null;
-    const scroller = scrollRef.current;
-    if (tab && scroller) (vertical ? revealVertically : revealHorizontally)(scroller, tab);
-  }, [activeId, vertical]);
+    revealTab(activeId);
+  }, [activeId, revealTab]);
 
   const focusTab = (index: number) => {
     const item = items[(index + items.length) % items.length];
@@ -233,11 +309,23 @@ export function Tabs({
 
   const menuItems: MenuItem[] = items.map((t) => ({
     id: t.id,
-    label: tx(t.text ?? (typeof t.label === "string" ? t.label : t.id)),
+    label: given(t.text ?? (typeof t.label === "string" ? t.label : t.id)),
     icon: t.icon,
     checked: t.id === activeId ? true : undefined,
     run: () => onSelect(t.id),
   }));
+
+  // IDEA: a tab dragged within its strip leaves an empty slot the other tabs make room for;
+  // a tab dragged in from another strip shows an insertion line instead.
+  const order =
+    dragging !== null && drop !== null
+      ? previewOrder(
+          items.map((it) => it.id),
+          dragging,
+          drop,
+        )
+      : null;
+  const marker = dragging === null ? drop : null;
 
   return (
     <div
@@ -254,7 +342,7 @@ export function Tabs({
       <div
         ref={scrollRef}
         role="tablist"
-        aria-label={tx(aria["aria-label"])}
+        aria-label={given(aria["aria-label"])}
         aria-orientation={vertical ? "vertical" : undefined}
         className={styles.scroller}
         onWheel={(e) => {
@@ -273,22 +361,42 @@ export function Tabs({
                 selected && styles.selected,
                 closable && styles.closable,
                 dragging === item.id && styles.dragging,
-                drop === index && styles.dropBefore,
-                drop === items.length && index === items.length - 1 && styles.dropAfter,
+                marker === index && styles.dropBefore,
+                marker === items.length && index === items.length - 1 && styles.dropAfter,
                 item.tint && styles.tinted,
               )}
-              style={item.tint ? ({ "--tab-tint": item.tint } as CSSProperties) : undefined}
+              style={{ "--tab-tint": item.tint, order: order?.get(item.id) } as CSSProperties}
               onPointerDown={
                 dnd
                   ? (e) => {
-                      if ((e.target as Element).closest("[data-tab-close]")) return;
+                      if ((closeOnShiftClick && e.shiftKey) || (e.target as Element).closest("[data-tab-close]"))
+                        return;
                       startPointerDrag(
                         e,
                         e.currentTarget,
                         { type: dnd.type, payload: dnd.payload(item.id) },
                         {
-                          onStart: () => setDragging(item.id),
-                          onEnd: () => setDragging(null),
+                          onStart: () => {
+                            draggingRef.current = item.id;
+                            setDragging(item.id);
+                          },
+                          onEnd: (dragged, drop) => {
+                            draggingRef.current = null;
+                            setDragging(null);
+                            if (!dragged || !drop || drop.accepted) return;
+                            const outside = dnd.onDropOutside;
+                            if (!outside) return;
+                            const el = document.documentElement;
+                            const r = el.getBoundingClientRect();
+                            // The ghost (fixed, translated from the tab) never
+                            // covers the release point, so a miss outside the
+                            // viewport means the pointer left the window.
+                            const rect =
+                              r.width || r.height
+                                ? r
+                                : { left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight };
+                            if (isOutsideWindow(rect, drop.x, drop.y)) outside(dnd.payload(item.id), drop.x, drop.y);
+                          },
                         },
                       );
                     }
@@ -315,14 +423,25 @@ export function Tabs({
                 tabIndex={selected || (!activeId && index === 0) ? 0 : -1}
                 className={styles.tabButton}
                 style={item.color ? { color: item.color } : undefined}
-                onClick={() => onSelect(item.id)}
+                onClick={(e) => {
+                  // Shift+click is mouse-only: a keyboard Enter with Shift held still selects.
+                  if (closeOnShiftClick && e.shiftKey && e.detail > 0 && closable) {
+                    e.preventDefault();
+                    onClose!(item.id);
+                    return;
+                  }
+                  onSelect(item.id);
+                  // Revealing on every click: re-selecting the active tab doesn't change
+                  // `activeId`, so the reveal effect wouldn't re-run (#1740).
+                  revealTab(item.id);
+                }}
                 onDoubleClick={onDoubleClick ? () => onDoubleClick(item.id) : undefined}
                 onKeyDown={(e) => onKeyDown(e, index, item)}
-                {...tooltipAttrs(item.tooltip)}
+                {...tooltipAttrs(given(item.tooltip), undefined, true)}
               >
                 {item.icon && <Icon name={item.icon} size={14} className={styles.tabIcon} />}
                 <span className={clsx(styles.tabLabel, item.italic && styles.italic)}>
-                  {typeof item.label === "string" ? <T>{item.label}</T> : item.label}
+                  {typeof item.label === "string" ? <Given>{item.label}</Given> : item.label}
                 </span>
                 {item.trailing}
                 {item.modified && !closable && <span className={styles.modified} aria-label={tx("Modified")} />}

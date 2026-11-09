@@ -1,6 +1,8 @@
+import { parseArgs, formatArgs } from "@/platform/commandLine";
 /** Run configuration → DAP launch configuration, per adapter. */
 import { workflowSettings } from "@/platform/workflowSettings";
 import type { LaunchConfig, RunConfig } from "@/platform/ipc";
+import { hostOs } from "@/platform/remote";
 
 function isAbsolute(p: string) {
   return p.startsWith("/") || /^[A-Za-z]:[\\/]/.test(p);
@@ -57,14 +59,24 @@ function cargoLaunch(rc: RunConfig, cwd: string, adapter: string): LaunchConfig 
   };
 }
 
+const PYTHON_NAME = /^python[\d.]*(\.exe)?$/;
+
+/** `python` on Windows (`python3` is at most a Store alias there, and venvs have no `python3.exe`), `python3` elsewhere. */
+function systemPython(): string {
+  return hostOs() === "windows" ? "python" : "python3";
+}
+
 function pythonFor(rc: RunConfig, cwd: string): string {
   const cmd = rc.command;
   const name = cmd.split("/").pop() ?? cmd;
-  if (/^python[\d.]*(\.exe)?$/.test(name)) return resolveCommand(cmd, cwd);
+  if (PYTHON_NAME.test(name)) return resolveCommand(cmd, cwd);
   // A venv tool such as `.venv/bin/pytest`: use the interpreter next to it.
   if (cmd.includes("/")) return resolveCommand(cmd.slice(0, cmd.lastIndexOf("/") + 1) + "python", cwd);
-  return "python3";
+  return systemPython();
 }
+
+/** Project managers whose `run` executes in the project's environment (`uv run python …`). */
+const PYTHON_RUNNERS = new Set(["uv", "poetry", "pdm", "pipenv", "hatch", "rye"]);
 
 function debugpyLaunch(rc: RunConfig, cwd: string): LaunchConfig {
   const out = base(rc, "debugpy", cwd);
@@ -77,19 +89,29 @@ function debugpyLaunch(rc: RunConfig, cwd: string): LaunchConfig {
     redirectOutput: true,
   };
   if (dbg.python.gevent) extra.gevent = true;
-  const name = rc.command.split("/").pop() ?? rc.command;
-  const isPython = /^python[\d.]*(\.exe)?$/.test(name);
-  if (!isPython) {
+  const name = (rc.command.split("/").pop() ?? rc.command).replace(/\.exe$/, "");
+  let args = rc.args;
+  let tool: string | null = PYTHON_NAME.test(name) ? null : name;
+  if (PYTHON_RUNNERS.has(name) && args[0] === "run" && args[1]) {
+    // The debuggee runs through the manager (`uv run python <debugpy> …`) to get the project's
+    // environment; the adapter and its launcher need a plain interpreter.
+    const python = PYTHON_NAME.test(args[1]) ? args[1] : "python";
+    extra.python = [resolveCommand(rc.command, cwd), "run", python];
+    extra.debugLauncherPython = systemPython();
+    tool = PYTHON_NAME.test(args[1]) ? null : args[1];
+    args = args.slice(2);
+  }
+  if (tool) {
     // A console script (`pytest`, `uvicorn`, …): run it as a module.
-    extra.module = name.replace(/\.exe$/, "");
-    out.args = [...rc.args];
-  } else if (rc.args[0] === "-m" && rc.args[1]) {
-    extra.module = rc.args[1];
-    out.args = rc.args.slice(2);
-  } else if (rc.args[0]) {
-    out.program = join(cwd, rc.args[0]);
-    out.args = rc.args.slice(1);
-    if (rc.args[0].endsWith("manage.py")) extra.django = true;
+    extra.module = tool;
+    out.args = [...args];
+  } else if (args[0] === "-m" && args[1]) {
+    extra.module = args[1];
+    out.args = args.slice(2);
+  } else if (args[0]) {
+    out.program = join(cwd, args[0]);
+    out.args = args.slice(1);
+    if (args[0].endsWith("manage.py")) extra.django = true;
   }
   out.extraJson = JSON.stringify(extra);
   return out;
@@ -169,34 +191,100 @@ function jsDebugLaunch(rc: RunConfig, cwd: string): LaunchConfig {
   return out;
 }
 
-function delveLaunch(rc: RunConfig, cwd: string): LaunchConfig {
+function delveLaunch(rc: RunConfig, cwd: string, root: string): LaunchConfig {
   const out = base(rc, "delve", cwd);
-  const [sub, ...rest] = rc.args;
-  const [goArgs, programArgs] = splitAtDashDash(rest);
-  if (sub === "test") {
-    // `go test` selection flags become the test binary's (`-run ^TestX$` → `-test.run ^TestX$`).
-    const testFlags: string[] = [];
-    let pkg: string | undefined;
-    for (let i = 0; i < goArgs.length; i++) {
-      const a = goArgs[i]!;
-      const flag = /^--?(run|skip)(?:=(.*))?$/.exec(a);
-      if (flag) {
-        const value = flag[2] ?? goArgs[++i];
-        if (value !== undefined) testFlags.push(`-test.${flag[1]}`, value);
-      } else if (!a.startsWith("-")) pkg ??= a;
-    }
-    pkg ??= ".";
-    out.program = pkg.endsWith("/...") ? cwd : join(cwd, pkg);
-    out.extraJson = JSON.stringify({ mode: "test" });
-    out.args = [...testFlags, ...programArgs];
-  } else {
-    const flags = goArgs.filter((a) => a.startsWith("-"));
-    const positional = goArgs.filter((a) => !a.startsWith("-"));
-    const target = positional[0] ?? ".";
-    out.program = join(cwd, target);
-    out.args = [...positional.slice(1), ...programArgs];
-    out.extraJson = JSON.stringify(flags.length ? { mode: "debug", buildFlags: flags.join(" ") } : { mode: "debug" });
+  const p = rc.params;
+  if (p?.goKind) {
+    const module = join(root, p.module || ".");
+    const target = p.target || ".";
+    out.program =
+      p.scope === "package" && !target.startsWith(".") && !isAbsolute(target)
+        ? target
+        : join(module, target.split("|")[0]!.trim());
+    const test = p.goKind === "test";
+    const parsed = delveLaunch(
+      {
+        ...rc,
+        params: undefined,
+        args: [
+          test ? "test" : "build",
+          ...parseArgs(p.toolArgs ?? ""),
+          ...(test && p.pattern ? ["-run", p.pattern] : []),
+          target,
+          ...(test ? ["-args", ...parseArgs(p.programArgs ?? "")] : []),
+        ],
+      },
+      module,
+      root,
+    );
+    const toolArgs = parseArgs(JSON.parse(parsed.extraJson!).buildFlags ?? "");
+    out.args = test ? parsed.args : parseArgs(p.programArgs ?? "");
+    out.extraJson = JSON.stringify({
+      mode: p.goKind === "test" ? "test" : "debug",
+      buildFlags: toolArgs,
+      dlvCwd: module,
+      ...(p.scope === "file" ? { __goFiles: target.split("|").map((f) => join(module, f.trim())) } : {}),
+      __goToolArgs: toolArgs,
+      __goUseTags: p.useTags !== "false",
+      ...(p.outputDir ? { output: join(root, `${p.outputDir}/go-debug`) } : {}),
+    });
+    return out;
   }
+  const [sub, ...rest] = rc.args;
+  const test = sub === "test";
+  const flags: string[] = [];
+  const testFlags: string[] = [];
+  const targets: string[] = [];
+  let programArgs: string[] = [];
+  const boolFlags = new Set([
+    "-a",
+    "-n",
+    "-race",
+    "-msan",
+    "-asan",
+    "-cover",
+    "-linkshared",
+    "-modcacherw",
+    "-buildvcs",
+    "-trimpath",
+    "-v",
+    "-work",
+    "-x",
+    "-json",
+    "-c",
+  ]);
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i]!;
+    if (a === "--" || (test && a === "-args")) {
+      programArgs = rest.slice(i + 1);
+      break;
+    }
+    const selection =
+      test &&
+      /^-(run|skip|bench|benchtime|count|timeout|parallel|cpu|list|fuzz|fuzztime|fuzzminimizetime)(?:=(.*))?$/.exec(a);
+    if (test && /^-(short|failfast|benchmem|fullpath|v)(?:=|$)/.test(a)) {
+      testFlags.push(a.replace(/^-/, "-test."));
+    } else if (selection) {
+      const value = selection[2] ?? rest[++i];
+      if (value !== undefined) testFlags.push(`-test.${selection[1]}`, value);
+    } else if (a.startsWith("-")) {
+      if (test && (a === "-json" || a === "-c")) continue;
+      flags.push(a);
+      if (!a.includes("=") && !boolFlags.has(a) && rest[i + 1] !== undefined) flags.push(rest[++i]!);
+    } else if (!test && targets.length) {
+      programArgs = rest.slice(i);
+      break;
+    } else targets.push(a);
+  }
+  const target = targets[0] ?? ".";
+  out.program = target.endsWith("/...") ? cwd : join(cwd, target);
+  out.args = [...testFlags, ...programArgs];
+  out.extraJson = JSON.stringify({
+    mode: test ? "test" : "debug",
+    ...(flags.length ? { buildFlags: formatArgs(flags) } : {}),
+    __goToolArgs: flags,
+    __goUseTags: rc.params?.useTags !== "false",
+  });
   return out;
 }
 
@@ -222,26 +310,121 @@ function godotLaunch(rc: RunConfig, cwd: string): LaunchConfig {
 function nativeLaunch(rc: RunConfig, cwd: string, adapter: string): LaunchConfig {
   const out: LaunchConfig = { ...base(rc, adapter, cwd), program: resolveCommand(rc.command, cwd), args: [...rc.args] };
   // lldb-dap takes the environment as `KEY=VALUE` strings.
-  if (adapter === "lldb-dap")
-    out.extraJson = JSON.stringify({ env: Object.entries(rc.env).map(([k, v]) => `${k}=${v}`) });
+  if (adapter === "lldb-dap") {
+    const from = rc.params?.cmakeSourceRoot;
+    const to = rc.params?.cmakeCanonicalSourceRoot;
+    out.extraJson = JSON.stringify({
+      env: Object.entries(rc.env).map(([k, v]) => `${k}=${v}`),
+      ...(from && to && from !== to ? { sourceMap: [[from, to]] } : {}),
+    });
+  }
   return out;
+}
+
+/**
+ * Flutter: `flutter debug_adapter` starts the tool itself, so `program` is the
+ * entry point (`lib/main.dart`) — never the interpreter named by `command`.
+ */
+function flutterLaunch(rc: RunConfig, cwd: string, adapter: string): LaunchConfig {
+  // A file-scoped config carries the entry point as its last `.dart` argument
+  // (`dart run lib/main.dart`); a user config may name none, which is the
+  // conventional Flutter entry point.
+  const entry = [...rc.args].reverse().find((a) => a.endsWith(".dart")) ?? "lib/main.dart";
+  return {
+    ...base(rc, adapter, cwd),
+    program: join(cwd, entry),
+  };
+}
+
+/**
+ * Flutter add-to-app: the host app is built and installed by its own Gradle
+ * build, so the debugger attaches to the already running app instead of
+ * launching `lib/main.dart` (which would build the module on its own).
+ *
+ * `params.vm-service-uri` pins the VM Service endpoint (`flutter attach
+ * --debug-uri`); without it `flutter attach` discovers the running app on the
+ * device. `params.device` becomes `-d <device>`.
+ */
+function flutterAttach(rc: RunConfig, cwd: string, adapter: string): LaunchConfig {
+  const p = rc.params ?? {};
+  const uri = p["vm-service-uri"] || p.vmServiceUri;
+  const device = p.device;
+  // `__flutter` tells the adapter launcher to use `flutter debug_adapter`
+  // whatever the working directory holds (an add-to-app module lives below a
+  // workspace root that has no Flutter dependency of its own). It is removed
+  // before the request reaches the adapter.
+  const extra: Record<string, unknown> = { __flutter: true };
+  if (uri) extra.vmServiceUri = uri;
+  if (device) extra.toolArgs = ["-d", device];
+  return {
+    ...base(rc, adapter, cwd),
+    request: "attach",
+    program: null,
+    extraJson: JSON.stringify(extra),
+  };
+}
+
+const PHP_NAME = /^php(\d+(\.\d+)*)?(\.exe)?$/i;
+
+/**
+ * php-debug runs `runtimeExecutable runtimeArgs program args` and doesn't enable Xdebug: debug mode and
+ * the connection back come from `-d` options, to the free port php-debug picks for `port: 0` (another
+ * IDE may listen on 9003). `php` is the PHP chosen in Settings, used when the command doesn't name one.
+ */
+function phpDebugLaunch(rc: RunConfig, cwd: string, php: string | null): LaunchConfig {
+  const name = rc.command.split(/[\\/]/).pop() ?? rc.command;
+  const runtimeArgs = ["-dxdebug.mode=debug", "-dxdebug.start_with_request=yes", "-dxdebug.client_port=${port}"];
+  let runtime = php;
+  let program: string;
+  let args: string[];
+  if (PHP_NAME.test(name)) {
+    // `php [options] script args`: the options stay with PHP; the script is a file (`artisan`).
+    if (name !== rc.command) runtime = resolveCommand(rc.command, cwd);
+    const at = rc.args.findIndex((a) => !a.startsWith("-"));
+    runtimeArgs.push(...(at < 0 ? rc.args : rc.args.slice(0, at)));
+    program = at < 0 ? "" : join(cwd, rc.args[at]!);
+    args = at < 0 ? [] : rc.args.slice(at + 1);
+  } else {
+    // A PHP script run directly (`vendor/bin/phpunit`; on Windows its `.bat` shim sits beside it).
+    program = resolveCommand(rc.command.replace(/\.bat$/i, ""), cwd);
+    args = [...rc.args];
+  }
+  return {
+    ...base(rc, "php-debug", cwd),
+    program,
+    args,
+    extraJson: JSON.stringify({ port: 0, runtimeArgs, ...(runtime ? { runtimeExecutable: runtime } : {}) }),
+  };
 }
 
 /**
  * The launch configuration that debugs `rc`, or `null` when it has no adapter.
  * `root` is the project root (default working directory).
  */
-export function launchConfigFor(rc: RunConfig, root: string): LaunchConfig | null {
+export function launchConfigFor(rc: RunConfig, root: string, php: string | null = null): LaunchConfig | null {
   const adapter = rc.debugAdapter;
   if (!adapter || debugUnsupportedReason(rc)) return null;
   const cwd = rc.cwd ? join(root, rc.cwd) : root;
+  if (adapter === "dart") {
+    return rc.params?.request === "attach" ? flutterAttach(rc, cwd, adapter) : flutterLaunch(rc, cwd, adapter);
+  }
   if (adapter === "codelldb" || adapter === "lldb-dap") {
     return rc.kind === "cargo" ? cargoLaunch(rc, cwd, adapter) : nativeLaunch(rc, cwd, adapter);
   }
   if (adapter === "debugpy") return debugpyLaunch(rc, cwd);
   if (adapter === "js-debug") return jsDebugLaunch(rc, cwd);
-  if (adapter === "delve") return delveLaunch(rc, cwd);
+  if (adapter === "delve") return delveLaunch(rc, cwd, root);
   if (adapter === "godot") return godotLaunch(rc, cwd);
+  if (adapter === "php-debug") return phpDebugLaunch(rc, cwd, php);
+  if (adapter === "netcoredbg" && rc.kind === "dotnet") {
+    if (!rc.params?.targetPath) return null;
+    return {
+      ...base(rc, adapter, cwd),
+      program: rc.params.targetPath,
+      args: parseArgs(rc.params.programArgs?.trim() ? rc.params.programArgs : rc.params.profileArgs || ""),
+      extraJson: JSON.stringify({ justMyCode: workflowSettings().debugger.skipLibraryCode }),
+    };
+  }
   // Adapters without a template (hidden in Edit Configurations): generic arguments.
   return {
     ...base(rc, adapter, cwd),

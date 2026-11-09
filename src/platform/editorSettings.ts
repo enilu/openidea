@@ -15,7 +15,18 @@ export interface TextAttributesOverride {
   effectColor?: string;
 }
 
+export interface CustomColorScheme {
+  name: string;
+  parent: "dark" | "light";
+  attributes: Record<string, TextAttributesOverride>;
+}
+
+export type CustomColorSchemes = Record<string, CustomColorScheme>;
+
 export interface LanguageCodeStyle {
+  /** Java formatter; relative XML paths start at the project root. */
+  formatter?: "default" | "intellij" | "custom";
+  formatterPath?: string;
   useTab?: boolean;
   tabSize?: number;
   indent?: number;
@@ -55,6 +66,7 @@ export function lineCommentStyleFor(
 }
 
 export const EDITOR_EXTRA_DEFAULTS = {
+  customSchemes: {} as CustomColorSchemes,
   colorOverrides: {} as Record<string, Record<string, TextAttributesOverride>>,
   /** Color Scheme › Language Defaults › Semantic highlighting (rainbow locals / parameters). */
   semanticHighlighting: false,
@@ -67,6 +79,8 @@ export const EDITOR_EXTRA_DEFAULTS = {
   boldFontWeight: 700,
   general: {
     wheelZoom: false,
+    markdownImageFolder: "assets",
+    markdownImageNamePattern: "image-{timestamp}",
     dragAndDrop: true,
     caretScroll: "minimize",
     softWrapFiles: "*.md; *.txt; *.rst; *.adoc",
@@ -108,7 +122,7 @@ export const EDITOR_EXTRA_DEFAULTS = {
     parameterInfo: true,
     parameterInfoDelay: 1000,
   },
-  autoImport: { addUnambiguous: false, optimizeOnTheFly: false },
+  autoImport: { addUnambiguous: false, optimizeOnTheFly: false, importsOnPaste: "ask" as "ask" | "always" | "never" },
   folding: { showOutline: true, fileHeader: true, imports: true, docComments: false },
   tabs: {
     placement: "top",
@@ -137,7 +151,9 @@ export const EDITOR_EXTRA_DEFAULTS = {
     surroundSelection: true,
     tabOutOfPair: true,
     reformatOnPaste: "indentEachLine",
+    escapeOnPaste: true,
     smartIndent: true,
+    insertDocStub: true,
     backspaceUnindent: "autoindent",
   },
   codeEditing: {
@@ -175,7 +191,7 @@ export const EDITOR_EXTRA_DEFAULTS = {
     formatterOnTag: "@formatter:on",
     formatterTagsRegexp: false,
   },
-  encodings: { global: "utf-8", project: "utf-8", properties: "iso-8859-1", utf8Bom: "never" },
+  encodings: { global: "utf-8", project: "utf-8", properties: "iso-8859-1", nativeToAscii: false, utf8Bom: "never" },
 };
 
 export type EditorExtras = typeof EDITOR_EXTRA_DEFAULTS;
@@ -235,6 +251,7 @@ export function fontWeightVars(main: unknown, bold: unknown): Record<"--fw-code"
 
 export function validateEditorExtras(raw: unknown): EditorExtras {
   const out = coerceLike(raw, EDITOR_EXTRA_DEFAULTS);
+  if (!["ask", "always", "never"].includes(out.autoImport.importsOnPaste)) out.autoImport.importsOnPaste = "ask";
   out.fontWeight = fontWeightOf(out.fontWeight, EDITOR_EXTRA_DEFAULTS.fontWeight);
   out.boldFontWeight = fontWeightOf(out.boldFontWeight, EDITOR_EXTRA_DEFAULTS.boldFontWeight);
   return out;

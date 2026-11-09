@@ -35,6 +35,17 @@ pub(crate) fn create_file(path: &Path) -> IdeResult<()> {
     Ok(())
 }
 
+pub(crate) fn create_file_bytes(path: &Path, data: &[u8]) -> IdeResult<()> {
+    use std::io::Write;
+    if exists(path) {
+        return Err(already_exists(path));
+    }
+    ensure_parent(path)?;
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(data)?;
+    Ok(())
+}
+
 /// IDEA's "Toggle Read-only Attribute": read-only clears every write bit,
 /// writable adds the owner's.
 pub(crate) fn set_writable(path: &Path, writable: bool) -> IdeResult<()> {
@@ -77,7 +88,7 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-pub(crate) fn rename(from: &Path, to: &Path) -> IdeResult<()> {
+pub(crate) fn validate_rename(from: &Path, to: &Path) -> IdeResult<()> {
     if !exists(from) {
         return Err(not_found(from));
     }
@@ -87,6 +98,14 @@ pub(crate) fn rename(from: &Path, to: &Path) -> IdeResult<()> {
     // A case-only rename on a case-insensitive file system sees `to` as existing.
     if exists(to) && !same_file(from, to) {
         return Err(already_exists(to));
+    }
+    Ok(())
+}
+
+pub(crate) fn rename(from: &Path, to: &Path) -> IdeResult<()> {
+    validate_rename(from, to)?;
+    if from == to {
+        return Ok(());
     }
     ensure_parent(to)?;
     match fs::rename(from, to) {

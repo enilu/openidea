@@ -259,6 +259,47 @@ fn walk_honours_ignores() {
     assert_eq!(found, expected);
 }
 
+#[test]
+fn walk_scopes_gitignore_to_each_repository() {
+    let (_t, r) = root();
+    // An outer repository ignores everything under `projects/`, nested repository included (#1254).
+    write(&r.join("outer/.git/HEAD"), "ref: refs/heads/main\n");
+    write(&r.join("outer/top.txt"), "");
+    write(&r.join("outer/projects/.gitignore"), "*\n!.gitignore\n");
+    write(&r.join("outer/projects/nested/.git/HEAD"), "ref: refs/heads/main\n");
+    write(&r.join("outer/projects/nested/.git/info/exclude"), "local.txt\n");
+    write(&r.join("outer/projects/nested/.gitignore"), "*.log\n");
+    write(&r.join("outer/projects/nested/search-test.txt"), "");
+    write(&r.join("outer/projects/nested/src/a.rs"), "");
+    write(&r.join("outer/projects/nested/debug.log"), "");
+    write(&r.join("outer/projects/nested/local.txt"), "");
+    write(&r.join("outer/projects/plain/file.txt"), "");
+    write(&r.join("loose/.gitignore"), "*.log\n");
+    write(&r.join("loose/a.txt"), "");
+    write(&r.join("loose/b.log"), "");
+
+    let walk = |dir: &str| {
+        let base = r.join(dir);
+        let found = Mutex::new(BTreeSet::new());
+        walk_files(&base, &[], |p| {
+            found.lock().insert(p.strip_prefix(&base).unwrap().to_string_lossy().replace('\\', "/"));
+        });
+        found.into_inner().into_iter().collect::<Vec<_>>()
+    };
+    let cases: [(&str, &[&str]); 4] = [
+        // The nested repository's own rules apply; the outer repository's do not.
+        ("outer/projects/nested", &[".gitignore", "search-test.txt", "src/a.rs"]),
+        // A plain folder inside the outer repository is still governed by it, as in Git.
+        ("outer/projects/plain", &[]),
+        ("outer", &["projects/.gitignore", "top.txt"]),
+        // Outside any repository `.gitignore` still applies.
+        ("loose", &[".gitignore", "a.txt"]),
+    ];
+    for (dir, expected) in cases {
+        assert_eq!(walk(dir), expected, "{dir}");
+    }
+}
+
 fn wait_for(events: &Mutex<Vec<FsBatch>>, pred: impl Fn(&[FsBatch]) -> bool) -> bool {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
@@ -311,7 +352,9 @@ fn watcher_reports_changes() {
     );
     let paths = all(&batches.lock());
     assert!(!paths.contains(&r.join("noise.log")));
-    assert!(!paths.iter().any(|p| p.starts_with(r.join("target"))));
+    // `target/` itself is reported so the tree sees the excluded directory
+    // appear; its contents still stay filtered out.
+    assert!(!paths.iter().any(|p| p.starts_with(r.join("target")) && *p != r.join("target")));
     assert!(!paths.contains(&r.join(".git/objects/aa")));
     assert!(sunk.lock().iter().any(|e| matches!(e, IdeEvent::FsChanged { .. })));
 
@@ -364,4 +407,35 @@ fn worktree_and_nested_repository_local_excludes_are_reflected_in_listings() {
     std::fs::write(nested.join(".git/info/exclude"), "/private\n").unwrap();
     let entries = ide_vfs::read_dir(&nested, &[]).unwrap();
     assert!(entries.iter().find(|e| e.name == "private").unwrap().ignored);
+}
+
+#[test]
+fn create_file_bytes_is_exclusive() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("image.png");
+    let bytes = [0, 255, 128, 10];
+    ide_vfs::create_file_bytes(&path, &bytes).unwrap();
+    let error = ide_vfs::create_file_bytes(&path, b"replacement").unwrap_err();
+    assert_eq!(error.kind, ide_core::error::ErrorKind::AlreadyExists);
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn create_file_bytes_creates_parents() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nested/assets/image.png");
+    ide_vfs::create_file_bytes(&path, &[0, 255]).unwrap();
+    assert_eq!(std::fs::read(path).unwrap(), [0, 255]);
+}
+
+#[cfg(unix)]
+#[test]
+fn create_file_bytes_does_not_follow_existing_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target.png");
+    let link = dir.path().join("link.png");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let error = ide_vfs::create_file_bytes(&link, b"data").unwrap_err();
+    assert_eq!(error.kind, ide_core::error::ErrorKind::AlreadyExists);
+    assert!(!target.exists());
 }

@@ -57,6 +57,37 @@ fn fixture() -> Fixture {
     Fixture { _tmp: tmp, root, docs, events, rec }
 }
 
+#[test]
+fn own_disk_changes_preserve_the_open_documents_encoding() {
+    let f = fixture();
+    let path = f.root.join("query.sql");
+    let original = "SELECT '中文';\r\n";
+    fs::write(&path, ide_vfs::encode(original, "gbk", false).unwrap()).unwrap();
+    let mut defaults = f.docs.file_defaults();
+    defaults.project_fallback = "gbk".into();
+    f.docs.set_file_defaults(defaults.clone());
+    let doc = f.docs.open(&path).unwrap();
+    assert_eq!(doc.encoding, "gbk");
+    defaults.project_fallback = "windows-1252".into();
+    f.docs.set_file_defaults(defaults);
+    f.docs.sync_after_disk_change();
+    let unchanged = f.docs.snapshot(doc.id).unwrap();
+    assert_eq!(unchanged.text, doc.text);
+    assert_eq!(unchanged.encoding, "gbk");
+    assert!(!unchanged.dirty);
+    let changed = "SELECT '世界';\r\n";
+    let bytes = ide_vfs::encode(changed, "gbk", false).unwrap();
+    fs::write(&path, &bytes).unwrap();
+    f.docs.sync_after_disk_change();
+    let reloaded = f.docs.snapshot(doc.id).unwrap();
+    assert_eq!(reloaded.text, changed.replace("\r\n", "\n"));
+    assert_eq!(reloaded.encoding, "gbk");
+    assert_eq!(reloaded.line_ending, LineEnding::CrLf);
+    assert!(!reloaded.dirty);
+    f.docs.save_all().unwrap();
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+}
+
 fn change(from: u32, to: u32, insert: &str) -> ChangeSet {
     ChangeSet { changes: vec![TextChange { from, to, insert: insert.into() }] }
 }
@@ -314,6 +345,28 @@ fn backend_edits_emit_patches() {
 }
 
 #[test]
+fn external_change_in_two_places_patches_each() {
+    let f = fixture();
+    let path = f.root.join("two.txt");
+    let old: String = (0..400).map(|i| format!("line {i}\n")).collect();
+    fs::write(&path, &old).unwrap();
+    let id = f.docs.open(&path).unwrap().id;
+
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let new = old.replace("line 20\n", "line 20x\n").replace("line 299\n", "line 299x\n");
+    fs::write(&path, &new).unwrap();
+    f.docs.on_disk_changed(std::slice::from_ref(&path));
+
+    assert_eq!(f.docs.snapshot(id).unwrap().text, new);
+    let events = f.events.lock();
+    let changes = events.iter().find_map(|e| match e {
+        IdeEvent::DocPatched { changes, .. } => Some(changes),
+        _ => None,
+    });
+    assert_eq!(changes.map(Vec::len), Some(2));
+}
+
+#[test]
 fn external_changes() {
     let f = fixture();
     let path = f.root.join("ext.txt");
@@ -348,6 +401,46 @@ fn external_changes() {
 
     // Unknown paths are ignored.
     f.docs.on_disk_changed(&[f.root.join("other.txt")]);
+}
+
+/// An IDE operation that rewrites a file with the same length and mtime still refreshes
+/// the clean buffer.
+#[test]
+fn own_disk_change_preserving_length_and_mtime_reloads_a_clean_document() {
+    let f = fixture();
+    let path = f.root.join("stamp.txt");
+    fs::write(&path, "first").unwrap();
+    let id = f.docs.open(&path).unwrap().id;
+    let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+    fs::write(&path, "other").unwrap();
+    fs::File::options().write(true).open(&path).unwrap().set_modified(mtime).unwrap();
+    f.docs.sync_after_disk_change();
+    assert_eq!(f.docs.snapshot(id).unwrap().text, "other");
+}
+
+/// An external write that keeps the byte length and the mtime (timestamp-preserving
+/// tools, coarse-granularity filesystems) leaves the `(mtime, length)` stamp equal:
+/// the OS event is still authoritative, so a clean document reloads.
+#[test]
+fn external_change_preserving_length_and_mtime_reloads_a_clean_document() {
+    let f = fixture();
+    let path = f.root.join("stamp.txt");
+    fs::write(&path, "first").unwrap(); // 5 bytes
+    let id = f.docs.open(&path).unwrap().id;
+    let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+
+    fs::write(&path, "other").unwrap(); // 5 bytes, different content
+    fs::File::options().write(true).open(&path).unwrap().set_modified(mtime).unwrap();
+    f.docs.on_disk_changed(std::slice::from_ref(&path));
+    let snap = f.docs.snapshot(id).unwrap();
+    assert_eq!(snap.text, "other");
+    assert!(!snap.dirty);
+
+    // The reload recorded the new stamp: repeating the same event changes nothing.
+    let before = f.events.lock().len();
+    f.docs.on_disk_changed(std::slice::from_ref(&path));
+    assert_eq!(f.events.lock().len(), before);
+    assert_eq!(f.docs.snapshot(id).unwrap().text, "other");
 }
 
 #[test]
@@ -597,5 +690,157 @@ fn archive_entries_open_read_only_without_observers() {
     assert_eq!((info.text.as_str(), info.language.as_str(), info.read_only), ("fn main() {}\n", "rust", true));
     assert_eq!(*info.path, *path);
     assert!(f.rec.log.lock().is_empty(), "language servers / history never see archive entries");
+    fs::remove_file(&jar).unwrap();
+    f.docs.sync_from_disk();
+    assert_eq!(f.docs.snapshot(info.id).unwrap().version, info.version);
+    assert_eq!(f.docs.snapshot(info.id).unwrap().text, info.text);
     f.docs.close(info.id);
+}
+
+#[test]
+fn properties_conversion_uses_displayed_utf16_and_survives_reload() {
+    let f = fixture();
+    let path = f.root.join("messages.properties");
+    let original = "greeting=\\u4f60\\u597d\\uD83D\\uDE00!\r\nliteral=\\\\u0041\r\nbad=\\u12xz\r\n";
+    fs::write(&path, original).unwrap();
+    let mut defaults = f.docs.file_defaults();
+    defaults.native_to_ascii = true;
+    f.docs.set_file_defaults(defaults);
+    let doc = f.docs.open(&path).unwrap();
+    assert_eq!(doc.text, "greeting=你好😀!\nliteral=\\\\u0041\nbad=\\u12xz\n");
+    assert!(!doc.dirty);
+    assert_eq!(f.docs.text_snapshot(doc.id).unwrap().text, doc.text);
+    f.docs.save(doc.id).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
+    // Two BMP characters + one surrogate pair put ! at UTF-16 offset 13.
+    f.docs.edit(doc.id, doc.version, change(13, 14, "界")).unwrap();
+    f.docs.save(doc.id).unwrap();
+    let expected = "greeting=\\u4F60\\u597D\\uD83D\\uDE00\\u754C\r\nliteral=\\\\u0041\r\nbad=\\u12xz\r\n";
+    assert_eq!(fs::read(&path).unwrap(), expected.as_bytes());
+    assert!(f.rec.log.lock().iter().any(|line| line.contains("greeting=你好😀界")));
+    let saved = f.docs.snapshot(doc.id).unwrap();
+    f.docs.set_encoding(doc.id, "iso-8859-1", true).unwrap();
+    assert_eq!(f.docs.snapshot(doc.id).unwrap().version, saved.version);
+    // Force a watcher event even though the serialized contents are identical.
+    fs::File::options().write(true).open(&path).unwrap().set_modified(std::time::SystemTime::UNIX_EPOCH).unwrap();
+    f.docs.on_disk_changed(std::slice::from_ref(&path));
+    let reloaded = f.docs.snapshot(doc.id).unwrap();
+    assert_eq!(reloaded.text, saved.text);
+    assert_eq!(reloaded.version, saved.version);
+    assert!(!reloaded.dirty);
+    fs::write(&path, "greeting=\\u4E16\\u754C\r\n").unwrap();
+    f.docs.on_disk_changed(std::slice::from_ref(&path));
+    assert_eq!(f.docs.snapshot(doc.id).unwrap().text, "greeting=世界\n");
+    assert!(!f.docs.is_dirty(doc.id).unwrap());
+}
+
+#[test]
+fn properties_pasted_escapes_survive_save_and_decode_on_reload() {
+    let pasted = "test.key1=Hello\ntest.key2=\\u4F60\\u597D\ntest.key3=\\u4f60\\u597d\n";
+    let displayed = "test.key1=Hello\ntest.key2=你好\ntest.key3=你好\n";
+    for encoding in ["utf-8", "iso-8859-1", "utf-16le"] {
+        for eol in ["\n", "\r\n"] {
+            let f = fixture();
+            let path = f.root.join("test_zh_CN.properties");
+            let source = pasted.replace('\n', eol);
+            fs::write(&path, ide_vfs::encode(&source, encoding, encoding == "utf-16le").unwrap()).unwrap();
+            let mut defaults = f.docs.file_defaults();
+            defaults.native_to_ascii = true;
+            defaults.properties_fallback = encoding.into();
+            f.docs.set_file_defaults(defaults.clone());
+            let doc = f.docs.open(&path).unwrap();
+            assert_eq!(doc.text, displayed);
+
+            f.docs.replace_all(doc.id, pasted).unwrap();
+            f.docs.save(doc.id).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), source.as_bytes(), "{encoding} {eol:?}");
+            assert_eq!(f.docs.snapshot(doc.id).unwrap().text, pasted);
+            assert!(!f.docs.is_dirty(doc.id).unwrap());
+            f.docs.on_disk_changed(std::slice::from_ref(&path));
+            assert_eq!(f.docs.snapshot(doc.id).unwrap().text, pasted, "own saves do not reload");
+
+            f.docs.close(doc.id);
+            let reopened = f.docs.open(&path).unwrap();
+            assert_eq!(reopened.text, displayed);
+            // An edit followed by its inverse preserves the original escape casing.
+            f.docs.replace_all(reopened.id, pasted).unwrap();
+            f.docs.replace_all(reopened.id, displayed).unwrap();
+            f.docs.save(reopened.id).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), source.as_bytes());
+
+            let external = format!("{source}test.key4=\\uD83D\\uDE00{eol}");
+            fs::write(&path, &external).unwrap();
+            f.docs.on_disk_changed(std::slice::from_ref(&path));
+            assert_eq!(f.docs.snapshot(reopened.id).unwrap().text, format!("{displayed}test.key4=😀\n"));
+            defaults.native_to_ascii = false;
+            f.docs.set_file_defaults(defaults.clone());
+            f.docs.reload_properties();
+            assert_eq!(f.docs.snapshot(reopened.id).unwrap().text, external.replace("\r\n", "\n"));
+            defaults.native_to_ascii = true;
+            f.docs.set_file_defaults(defaults);
+            f.docs.reload_properties();
+            assert_eq!(f.docs.snapshot(reopened.id).unwrap().text, format!("{displayed}test.key4=😀\n"));
+            assert_eq!(fs::read_to_string(&path).unwrap(), external);
+        }
+    }
+}
+
+#[test]
+fn properties_toggle_reloads_only_clean_properties_and_pins_dirty_codec() {
+    let f = fixture();
+    let paths = ["clean.properties", "dirty.properties", "other.txt"].map(|name| f.root.join(name));
+    for path in &paths {
+        fs::write(path, r"value=\u4F60").unwrap();
+    }
+    let [clean, dirty, other] = paths.each_ref().map(|p| f.docs.open(p).unwrap());
+    f.docs.edit(dirty.id, dirty.version, change(12, 12, "!")).unwrap();
+    let mut defaults = f.docs.file_defaults();
+    defaults.native_to_ascii = true;
+    f.docs.set_file_defaults(defaults.clone());
+    f.docs.reload_properties();
+    assert_eq!(f.docs.snapshot(clean.id).unwrap().text, "value=你");
+    assert!(!f.docs.is_dirty(clean.id).unwrap());
+    assert_eq!(f.docs.snapshot(dirty.id).unwrap().text, r"value=\u4F60!");
+    assert!(!f.docs.native_to_ascii_for(&paths[1]));
+    assert_eq!(f.docs.snapshot(other.id).unwrap().text, r"value=\u4F60");
+    f.docs.save(dirty.id).unwrap();
+    assert_eq!(fs::read_to_string(&paths[1]).unwrap(), r"value=\u4F60!");
+    f.docs.reload_properties();
+    assert_eq!(f.docs.snapshot(dirty.id).unwrap().text, "value=你!");
+    f.docs.edit(dirty.id, f.docs.snapshot(dirty.id).unwrap().version, change(7, 8, "好")).unwrap();
+    defaults.native_to_ascii = false;
+    f.docs.set_file_defaults(defaults);
+    f.docs.reload_properties();
+    assert_eq!(f.docs.snapshot(clean.id).unwrap().text, r"value=\u4F60");
+    assert!(f.docs.native_to_ascii_for(&paths[1]));
+    f.docs.save(dirty.id).unwrap();
+    assert_eq!(fs::read_to_string(&paths[1]).unwrap(), r"value=\u4F60\u597D");
+}
+
+#[test]
+fn properties_ascii_noop_and_charset_conversion() {
+    let f = fixture();
+    let mut defaults = f.docs.file_defaults();
+    defaults.native_to_ascii = true;
+    f.docs.set_file_defaults(defaults);
+    for (i, source) in ["a=b\r\n# comment\r\n", r"a=\u0041", r"a=\\u0041", r"a=\uD800"].iter().enumerate() {
+        let path = f.root.join(format!("{i}.properties"));
+        fs::write(&path, source).unwrap();
+        let doc = f.docs.open(&path).unwrap();
+        f.docs.edit(doc.id, doc.version, change(0, 0, "x")).unwrap();
+        f.docs.edit(doc.id, doc.version + 1, change(0, 1, "")).unwrap();
+        f.docs.save(doc.id).unwrap();
+        f.docs.set_encoding(doc.id, "utf-8", true).unwrap();
+        f.docs.save(doc.id).unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), *source);
+    }
+    let path = f.root.join("utf16.properties");
+    fs::write(&path, ide_vfs::encode("a=你好😀", "utf-16le", true).unwrap()).unwrap();
+    let doc = f.docs.open(&path).unwrap();
+    f.docs.replace_all(doc.id, "a=世界😀").unwrap();
+    f.docs.save(doc.id).unwrap();
+    assert!(fs::read(&path).unwrap().is_ascii());
+    f.docs.set_encoding(doc.id, "utf-16le", true).unwrap();
+    assert_eq!(f.docs.snapshot(doc.id).unwrap().text, "a=世界😀");
+    assert!(!f.docs.is_dirty(doc.id).unwrap());
 }

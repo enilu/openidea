@@ -14,9 +14,9 @@
   &nbsp;·&nbsp;
   <a href="#benchmark">Benchmark</a>
   &nbsp;·&nbsp;
-  <a href="#build">Build</a>
+  <a href="#plugins">Plugins</a>
   &nbsp;·&nbsp;
-  <a href="https://discord.gg/2Zy4yn7gP">Discord</a>
+  <a href="#community">Community</a>
 </p>
 
 https://github.com/user-attachments/assets/234dd54c-1255-4b3a-b35c-533d78d737c0
@@ -25,7 +25,9 @@ OpenIDEA brings the IntelliJ IDEA way of working — its keymap, its tool window
 its search-everything habits — to a native app with a Rust core.
 
 Editor, code insight, debugger, Git, terminal, database and HTTP clients,
-for 60+ languages. Builds for macOS, Windows and Linux.
+for 60+ languages. Builds for macOS, Windows and Linux. On Windows, if you'd
+rather skip the installer, each release also ships a portable zip — unpack it
+and run `openidea.exe`.
 
 ## Benchmark
 
@@ -47,14 +49,15 @@ IDEA analyses Python more deeply, so "ready" doesn't mean the same work on
 both sides. Both are measured from the outside, the same way: see
 [`perf/compare`](perf/compare) to run it on your machine and projects.
 
-## Build
+## Plugins
 
-```sh
-pnpm install
-pnpm tauri dev
-```
+Plugins add actions, completion, quick fixes, tool windows, custom editors,
+themes, file icons and languages. They run as sandboxed WebAssembly components;
+themes, icon themes and languages need no code at all.
 
-Rust 1.96, Node 22.19 or newer, pnpm and the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/).
+Install them from Settings › Plugins, or start your own with
+`openidea-plugin new` — see [Writing OpenIDEA plugins](plugins/README.md) and
+the [official plugins](plugins/official). The plugin API is still a preview.
 
 ## Window projects
 
@@ -73,14 +76,18 @@ If a folder is missing or unreadable, opening it leaves the current project unch
 If loading fails after closing the previous project, both entries remain in the list and
 the window has no active project; either project can be opened again from the sidebar.
 
-Native notebook execution tests are opt-in and need two distinct Python environments
-with `ipykernel` installed:
+## Community
 
-```sh
-OPENIDEA_TEST_PYTHON=/first/env/bin/python \
-OPENIDEA_TEST_PYTHON_SECOND=/second/env/bin/python \
-cargo test -p ide-notebook --test kernel_runtime -- --ignored --test-threads=1
-```
+- [Discord](https://discord.gg/2Zy4yn7gP) — questions, feedback and release news.
+- WeChat group — scan to join:
+
+  <img src="docs/assets/wechat-group.png" alt="WeChat group QR code" width="200">
+
+### Contributors
+
+<a href="https://github.com/l0ng-ai/openidea/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=l0ng-ai/openidea&max=100" alt="OpenIDEA contributors">
+</a>
 
 ## License
 

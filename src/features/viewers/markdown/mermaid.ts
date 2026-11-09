@@ -3,8 +3,11 @@
  * `[data-mermaid]` placeholder holding the source in `pre > code`; this module
  * turns placeholders into SVG. The library is imported on first use only.
  */
+import { fontsLoaded } from "@/platform/fonts";
 import type { Mermaid } from "mermaid";
 import { resolveTokenColor, toRgb } from "@/platform/cssColor";
+import { themeKey } from "@/platform/themeWatch";
+import { attachPanZoom } from "../panZoom";
 
 export const MERMAID_SELECTOR = "[data-mermaid]";
 const OUTPUT_CLASS = "mermaid-output";
@@ -25,24 +28,6 @@ function loadMermaid(): Promise<Mermaid> {
   loading ??= import("mermaid").then((m) => m.default);
   loading.catch(() => (loading = null));
   return loading;
-}
-
-/** Theme identity: anything that changes the colours read below. */
-export function themeKey(): string {
-  const root = document.documentElement;
-  const { theme = "", contrast = "", colorTheme = "", pluginTheme = "" } = root.dataset;
-  return `${theme}|${contrast}|${colorTheme}|${pluginTheme}|${root.style.getPropertyValue("--accent")}`;
-}
-
-/** Calls `cb` when the theme attributes (a plugin theme's included) or the accent on the root change. */
-export function subscribeTheme(cb: () => void): () => void {
-  if (typeof MutationObserver === "undefined") return () => {};
-  const observer = new MutationObserver(cb);
-  observer.observe(document.documentElement, {
-    attributes: true,
-    attributeFilter: ["data-theme", "data-contrast", "data-color-theme", "data-plugin-theme", "style"],
-  });
-  return () => observer.disconnect();
 }
 
 /**
@@ -101,6 +86,7 @@ function removeTemp(id: string) {
 
 async function renderOne(source: string, key: string): Promise<Result> {
   const mermaid = await loadMermaid();
+  await fontsLoaded(getComputedStyle(document.documentElement).getPropertyValue("--font-ui").trim(), 16);
   configure(mermaid, key);
   const id = `openidea-mermaid-${++seq}`;
   try {
@@ -126,12 +112,38 @@ function remember(k: string, r: Result) {
   cache.set(k, r);
 }
 
+const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+let applied = 0;
+/**
+ * A fresh render carries unique ids (mermaid draws under a unique root id), but a cache
+ * hit reapplies the first render's SVG string. Two copies in one document — the same
+ * diagram twice, or one drawn again while the first sits hidden (a closed details, an
+ * inactive tab) — collide on their marker ids, and Chromium resolves the `url(#…)`
+ * references against the hidden copy, losing arrowheads. Rewrites every id per
+ * application: longest first, so an id that extends a shorter one moves out of the way.
+ */
+function reid(svg: string): string {
+  const ids = [...new Set([...svg.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]!))];
+  if (!ids.length) return svg;
+  const suffix = `-c${++applied}`;
+  // References come as `id="…"`, `href="#…"` and `url(#…)`; the lookahead keeps
+  // an id that extends this one untouched.
+  for (const id of ids.sort((a, b) => b.length - a.length)) {
+    svg = svg.replace(
+      new RegExp(`(\\bid="|#|url\\(#)${escapeRegExp(id)}(?="|\\))`, "g"),
+      (_m, prefix: string) => `${prefix}${id}${suffix}`,
+    );
+  }
+  return svg;
+}
+
 function show(block: HTMLElement, result: Result | null, stale?: Node) {
   block.querySelector(`:scope > .${OUTPUT_CLASS}`)?.remove();
   const out = document.createElement("div");
   out.className = OUTPUT_CLASS;
   if (result && "svg" in result) {
-    out.innerHTML = result.svg;
+    out.innerHTML = reid(result.svg);
     block.setAttribute(RENDERED_ATTR, "ok");
   } else if (result) {
     out.setAttribute("role", "alert");
@@ -146,6 +158,7 @@ function show(block: HTMLElement, result: Result | null, stale?: Node) {
     return;
   }
   block.append(out);
+  if (block.getAttribute(RENDERED_ATTR) === "ok") attachPanZoom(out);
 }
 
 export const hasMermaid = (root: ParentNode) => root.querySelector(MERMAID_SELECTOR) !== null;
@@ -175,7 +188,8 @@ export function renderMermaidIn(root: HTMLElement, previous: Node[] = []): Merma
     const cached = cache.get(k);
     const keep = () => {
       const out = block.querySelector(`:scope > .${OUTPUT_CLASS}`);
-      if (out && block.getAttribute(RENDERED_ATTR) === "ok") previous[i] = out.firstChild ?? out;
+      if (out && block.getAttribute(RENDERED_ATTR) === "ok")
+        previous[i] = out.querySelector("svg") ?? out.firstChild ?? out;
     };
     if (cached) {
       show(block, cached);

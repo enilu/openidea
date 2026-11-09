@@ -46,16 +46,18 @@ struct StopCommand {
 }
 
 struct Entry {
+    project_root: PathBuf,
     id: RunId,
     config_id: String,
     name: String,
-    pid: Option<u32>,
-    stdin: Mutex<Option<Box<dyn Write + Send>>>,
+    pid: Mutex<Option<u32>>,
+    stdin: Mutex<Option<ide_core::input::InputWriter>>,
     /// The PTY master of a terminal-emulated run (resize; dropped on exit).
     pty: Option<Mutex<Option<Box<dyn MasterPty + Send>>>>,
     stop: Option<StopCommand>,
     output: OutputFn,
     exited: AtomicBool,
+    code: Mutex<Option<i32>>,
     stopping: AtomicBool,
 }
 
@@ -65,7 +67,7 @@ impl Entry {
             id: self.id,
             config_id: self.config_id.clone(),
             name: self.name.clone(),
-            pid: self.pid,
+            pid: *self.pid.lock(),
             running: !self.exited.load(Ordering::Acquire),
             pty: self.pty.is_some(),
         }
@@ -79,6 +81,8 @@ pub struct StartOptions {
     pub encoding: Option<String>,
     /// Project content and source roots added to Python launch environments.
     pub python_paths: Vec<PathBuf>,
+    /// Where the Ruby test reporter is installed (see [`crate::ruby_reporter`]); Ruby test runs load it.
+    pub ruby_reporter: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -139,7 +143,7 @@ pub(crate) fn invocation(config: &RunConfig, cwd: &Path) -> Invocation {
     if config.args.is_empty() && looks_like_shell && !cwd.join(command).is_file() {
         return shell_invocation(command, windows, std::env::var("COMSPEC").ok());
     }
-    let program = resolve_program(command, cwd, &config.env, windows);
+    let program = resolve_program(command, cwd, config, windows);
     let mut display = quote(command);
     for a in &config.args {
         display.push(' ');
@@ -194,8 +198,21 @@ fn match_console_encoding(
         output_encoding::fix(&program, &inv.args, &env.vars, inherited, encoding, cfg!(windows))
     };
     env.vars.extend(fix.env);
-    if !fix.java_args.is_empty() && !inv.raw_args {
-        inv.args.splice(0..0, fix.java_args);
+    let mut prepend = fix.java_args;
+    if fix.gradle_init_script {
+        match crate::gradle_jvm::write_script(
+            &crate::gradle_jvm::default_dir(),
+            "file-encoding",
+            output_encoding::GRADLE_FILE_ENCODING_SCRIPT,
+        ) {
+            Ok(script) => prepend.extend(["--init-script".to_owned(), script.to_string_lossy().into_owned()]),
+            Err(e) => tracing::warn!("cannot write the Gradle file.encoding init script: {e}"),
+        }
+    }
+    let changed = fix.args.is_some() || !prepend.is_empty();
+    if changed && !inv.raw_args {
+        inv.args = fix.args.unwrap_or_else(|| std::mem::take(&mut inv.args));
+        inv.args.splice(0..0, prepend);
         let mut display = quote(config.command.trim());
         for a in &inv.args {
             display.push(' ');
@@ -239,22 +256,34 @@ fn shell_invocation(command: &str, windows: bool, comspec: Option<String>) -> In
 }
 
 /// The program to spawn: relative paths like `./gradlew` or `.venv/bin/python`
-/// against the run directory; on Windows a bare name through `PATH` × `PATHEXT`
-/// (`kotlinc` → `kotlinc.bat`), which `Command` would only try as `.exe`.
-fn resolve_program(command: &str, cwd: &Path, env: &BTreeMap<String, String>, windows: bool) -> PathBuf {
+/// against the run directory; a bare name through the configuration's search path
+/// (on Windows, first the run directory, also with `PATHEXT`: `kotlinc` → `kotlinc.bat`), so launchers installed
+/// outside the app's own `PATH` (`mvn` in a version manager's shims) still start.
+fn resolve_program(command: &str, cwd: &Path, config: &RunConfig, windows: bool) -> PathBuf {
     let path = Path::new(command);
     if path.is_relative() && path.components().count() > 1 {
         return cwd.join(path);
     }
-    if windows && path.components().count() == 1 && path.is_relative() {
-        let search = env
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
-            .map(|(_, v)| std::ffi::OsString::from(v))
-            .or_else(|| std::env::var_os("PATH"))
-            .unwrap_or_default();
+    if path.components().count() == 1 && path.is_relative() {
+        let search = crate::wrap::search_path(config);
         let pathext = std::env::var("PATHEXT").ok();
-        if let Some(found) = crate::which::find_executable_in(command, &search, true, pathext.as_deref()) {
+        if windows {
+            // As cmd.exe does: the run directory first, a name with an extension as is,
+            // an extensionless one only through PATHEXT (a POSIX `gradlew` script is not runnable).
+            let local = cwd.join(path);
+            if path.extension().is_some() && local.is_file() {
+                return local;
+            }
+            if path.extension().is_none()
+                && let Some(found) = crate::which::executable_names(command, true, pathext.as_deref())
+                    .iter()
+                    .map(|name| cwd.join(name))
+                    .find(|p| p.is_file())
+            {
+                return found;
+            }
+        }
+        if let Some(found) = crate::which::find_executable_in(command, &search, windows, pathext.as_deref()) {
             return found;
         }
     }
@@ -303,18 +332,35 @@ impl ProcessManager {
         if config.command.trim().is_empty() {
             return Err(IdeError::invalid("run configuration has no command"));
         }
+        let approved = match crate::external::approved(config) {
+            Some(Ok(c)) => Some(c),
+            Some(Err(e)) => return Err(IdeError::new(ide_core::error::ErrorKind::PermissionDenied, e)),
+            None => None,
+        };
+        let config = approved.as_ref().unwrap_or(config);
+        let plan = crate::go::plan(root, config)?;
+        let followup = plan.as_ref().and_then(|p| p.run.as_ref()).map(|run| {
+            let cwd = resolve_cwd(root, run.cwd.as_deref());
+            (run.clone(), cwd)
+        });
+        let config = plan.as_ref().map_or(config, |p| &p.build);
         let cwd = resolve_cwd(root, config.cwd.as_deref());
         if !cwd.is_dir() {
             return Err(IdeError::not_found(format!("working directory does not exist: {}", cwd.display())));
         }
+        crate::detect::cmake::prepare(config, &cwd)?;
         let mut inv = invocation(config, &cwd);
         let extras = &config.extras;
         if extras.emulate_terminal && extras.stdin_file.is_some() {
             return Err(IdeError::invalid("input cannot be redirected from a file when emulating a terminal"));
         }
         let mut env = launch_env(root, config)?;
-        if matches!(config.kind.as_str(), "python" | "pytest") {
+        if matches!(config.kind.as_str(), "python" | "pytest" | "django-test") {
             crate::python_path::extend(&mut env.vars, &options.python_paths, !env.clear)?;
+        }
+        if let Some(dir) = options.ruby_reporter.as_deref().filter(|_| crate::ruby_reporter::applies(config)) {
+            crate::ruby_preload::add(&mut env.vars, dir, crate::ruby_reporter::FEATURE, !env.clear);
+            env.vars.insert("OPENIDEA_TEST_REPORT".into(), "1".into());
         }
         let on_output: OutputFn = Arc::from(on_output);
         let on_output = match extras.output_file.as_deref() {
@@ -330,8 +376,11 @@ impl ProcessManager {
         let notice =
             if extras.emulate_terminal { None } else { match_console_encoding(&mut inv, &mut env, config, options) };
         let temp = shorten_java(&mut inv, config, &cwd)?;
+        if extras.emulate_terminal && followup.is_some() {
+            return Err(IdeError::invalid("Go build and run requires the output console"));
+        }
         if extras.emulate_terminal {
-            return self.start_pty(config, &inv, &cwd, &env, stop, options, sink, on_output, temp);
+            return self.start_pty(root, config, &inv, &cwd, &env, stop, options, sink, on_output, temp);
         }
 
         let mut cmd = Command::new(&inv.program);
@@ -373,20 +422,40 @@ impl ProcessManager {
         })?;
 
         let id = RunId::next();
-        let stdin: Option<Box<dyn Write + Send>> = match child.stdin.take() {
-            Some(pipe) if !redirected => Some(Box::new(pipe)),
-            _ => None,
-        };
+        let stdin = (|| -> std::io::Result<_> {
+            Ok(match child.stdin.take() {
+                Some(pipe) if !redirected => {
+                    #[cfg(unix)]
+                    let wait_writable = {
+                        use std::os::fd::AsRawFd;
+                        ide_core::input::nonblocking(pipe.as_raw_fd())?
+                    };
+                    Some(input_writer(
+                        id,
+                        Box::new(pipe),
+                        #[cfg(unix)]
+                        wait_writable,
+                    )?)
+                }
+                _ => None,
+            })
+        })()
+        .inspect_err(|_| {
+            let _ = child.kill();
+            let _ = child.wait();
+        })?;
         let entry = Arc::new(Entry {
+            project_root: root.to_path_buf(),
             id,
             config_id: config.id.clone(),
             name: config.name.clone(),
-            pid: Some(child.id()),
+            pid: Mutex::new(Some(child.id())),
             stdin: Mutex::new(stdin),
             pty: None,
             stop,
             output: on_output.clone(),
             exited: AtomicBool::new(false),
+            code: Mutex::new(None),
             stopping: AtomicBool::new(false),
         });
         self.register(entry.clone());
@@ -398,12 +467,26 @@ impl ProcessManager {
         let stderr = child.stderr.take();
         let result = (|| -> std::io::Result<()> {
             if let Some(out) = stdout {
-                spawn_reader(id, Stream::Stdout, out, tx.clone())?;
+                spawn_reader(
+                    id,
+                    Stream::Stdout,
+                    out,
+                    tx.clone(),
+                    #[cfg(unix)]
+                    None,
+                )?;
             }
             if let Some(err) = stderr {
-                spawn_reader(id, Stream::Stderr, err, tx.clone())?;
+                spawn_reader(
+                    id,
+                    Stream::Stderr,
+                    err,
+                    tx.clone(),
+                    #[cfg(unix)]
+                    None,
+                )?;
             }
-            spawn_pump(rx, on_output, entry.clone(), sink, options.encoding.clone(), notice)?;
+            spawn_pump(rx, on_output.clone(), entry.clone(), sink, options.encoding.clone(), notice)?;
             Ok(())
         })();
         if let Err(e) = result {
@@ -414,10 +497,17 @@ impl ProcessManager {
         }
         // The waiter owns the child; it must exist for the pump to ever finish.
         let waiter_tx = tx;
+        let waiter_entry = entry.clone();
+        let run_root = root.to_path_buf();
         std::thread::Builder::new()
             .name(format!("openidea-run-wait-{}", id.0))
             .spawn(move || {
-                let status = child.wait();
+                let mut status = child.wait();
+                if status.as_ref().is_ok_and(ExitStatus::success)
+                    && let Some((run, cwd)) = followup
+                {
+                    status = run_followup(&run_root, &run, &cwd, &waiter_entry, &waiter_tx);
+                }
                 drop(temp);
                 let _ = waiter_tx.send(Msg::Exited(Exit::Pipes(status)));
             })
@@ -431,6 +521,7 @@ impl ProcessManager {
     #[allow(clippy::too_many_arguments)]
     fn start_pty(
         &self,
+        root: &Path,
         config: &RunConfig,
         inv: &Invocation,
         cwd: &Path,
@@ -465,6 +556,14 @@ impl ProcessManager {
         for (k, v) in &env.vars {
             cmd.env(k, v);
         }
+        #[cfg(unix)]
+        let wait_writable = ide_core::input::nonblocking(
+            pair.master.as_raw_fd().ok_or_else(|| std::io::Error::other("PTY has no file descriptor"))?,
+        )?;
+        #[cfg(unix)]
+        let wait_readable = ide_core::input::readable(
+            pair.master.as_raw_fd().ok_or_else(|| std::io::Error::other("PTY has no file descriptor"))?,
+        )?;
         let mut child = pair.slave.spawn_command(cmd).map_err(|e| {
             let text = e.to_string();
             if text.contains("No such file") || text.contains("not found") {
@@ -479,24 +578,43 @@ impl ProcessManager {
         let writer = pair.master.take_writer().map_err(|e| IdeError::internal(format!("pty writer: {e}")))?;
 
         let id = RunId::next();
+        let writer = input_writer(
+            id,
+            writer,
+            #[cfg(unix)]
+            wait_writable,
+        )
+        .inspect_err(|_| {
+            let _ = child.kill();
+            let _ = child.wait();
+        })?;
         let entry = Arc::new(Entry {
+            project_root: root.to_path_buf(),
             id,
             config_id: config.id.clone(),
             name: config.name.clone(),
-            pid: child.process_id(),
+            pid: Mutex::new(child.process_id()),
             stdin: Mutex::new(Some(writer)),
             pty: Some(Mutex::new(Some(pair.master))),
             stop,
             output: on_output.clone(),
             exited: AtomicBool::new(false),
+            code: Mutex::new(None),
             stopping: AtomicBool::new(false),
         });
         self.register(entry.clone());
         on_output(OutputChunk::System { text: format!("{}\n", inv.display) });
 
         let (tx, rx) = mpsc::channel();
-        let result = spawn_reader(id, Stream::Stdout, reader, tx.clone())
-            .and_then(|_| spawn_pump(rx, on_output, entry.clone(), sink, options.encoding.clone(), None));
+        let result = spawn_reader(
+            id,
+            Stream::Stdout,
+            reader,
+            tx.clone(),
+            #[cfg(unix)]
+            Some(Box::new(wait_readable)),
+        )
+        .and_then(|_| spawn_pump(rx, on_output, entry.clone(), sink, options.encoding.clone(), None));
         if let Err(e) = result {
             let _ = child.kill();
             let _ = child.wait();
@@ -548,16 +666,9 @@ impl ProcessManager {
         if entry.exited.load(Ordering::Acquire) {
             return Err(IdeError::invalid("process has exited"));
         }
-        let mut stdin = entry.stdin.lock();
-        let pipe = stdin.as_mut().ok_or_else(|| IdeError::invalid("stdin is closed"))?;
-        let res = pipe.write_all(data.as_bytes()).and_then(|_| pipe.flush());
-        if let Err(e) = res {
-            if e.kind() == std::io::ErrorKind::BrokenPipe {
-                *stdin = None;
-            }
-            return Err(e.into());
-        }
-        Ok(())
+        let stdin = entry.stdin.lock();
+        let pipe = stdin.as_ref().ok_or_else(|| IdeError::invalid("stdin is closed"))?;
+        pipe.write(data.as_bytes()).map_err(Into::into)
     }
 
     /// Closes the process's stdin (sends EOF; on a terminal, types ^D).
@@ -566,7 +677,9 @@ impl ProcessManager {
         if entry.pty.is_some() {
             return self.write_stdin(id, "\u{4}");
         }
-        entry.stdin.lock().take();
+        if let Some(stdin) = entry.stdin.lock().as_ref() {
+            stdin.finish();
+        }
         Ok(())
     }
 
@@ -575,15 +688,19 @@ impl ProcessManager {
         self.stop_with_grace(id, STOP_GRACE)
     }
 
-    /// [`Self::stop`] with an explicit grace period before the kill. A configuration's
-    /// stop command runs first; signals follow only if the process outlives it.
+    /// [`Self::stop`] with an explicit grace period for the configured stop command. The
+    /// first stop only asks the process tree to exit (stop command, then `SIGINT`) and waits;
+    /// a second stop kills it.
     pub fn stop_with_grace(&self, id: RunId, grace: Duration) -> IdeResult<()> {
         let entry = self.entry(id)?;
-        if entry.exited.load(Ordering::Acquire) {
+        let already_stopping = entry.stopping.swap(true, Ordering::AcqRel);
+        let Some(pid) = *entry.pid.lock() else { return Ok(()) };
+        // A run that ended by itself can leave members of its group behind: a Stop must
+        // still be able to reach them.
+        if entry.exited.load(Ordering::Acquire) && !group_alive(pid, &entry) {
             return Ok(());
         }
-        let Some(pid) = entry.pid else { return Ok(()) };
-        if entry.stopping.swap(true, Ordering::AcqRel) {
+        if already_stopping {
             // Second stop request: don't wait out the grace period.
             kill_tree(pid, true);
             return Ok(());
@@ -612,13 +729,24 @@ impl ProcessManager {
                     }
                     kill_tree(pid, false);
                 }
-                if !exits_within(grace) {
-                    tracing::debug!(id = %entry.id, pid, "process ignored interrupt; killing");
-                    kill_tree(pid, true);
+                // A first Stop only asks the process tree to exit, as IDEA does: it waits for
+                // the shutdown to finish (a Spring Boot app can take seconds) and a second Stop
+                // is what kills. Killing on a timer here cut shutdown logs off with SIGKILL.
+                while group_alive(pid, &entry) {
+                    std::thread::sleep(Duration::from_millis(50));
                 }
             })
             .map_err(|e| IdeError::internal(format!("failed to start stop thread: {e}")))?;
         Ok(())
+    }
+
+    /// Returns `None` while running, or the exit code once output has drained.
+    pub fn exit_code(&self, id: RunId) -> IdeResult<Option<Option<i32>>> {
+        let entry = self.entry(id)?;
+        if !entry.exited.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        Ok(Some(*entry.code.lock()))
     }
 
     pub fn list(&self) -> Vec<RunInfo> {
@@ -626,10 +754,21 @@ impl ProcessManager {
     }
 
     /// Kills every running process tree at once (shutting down).
+    pub fn kill_project(&self, root: &Path) {
+        for entry in self.runs.lock().values().filter(|e| e.project_root == root) {
+            if !entry.exited.load(Ordering::Acquire)
+                && let Some(pid) = *entry.pid.lock()
+            {
+                kill_tree(pid, true);
+            }
+        }
+    }
+
     pub fn kill_all(&self) {
         for entry in self.runs.lock().values() {
+            entry.stopping.store(true, Ordering::Release);
             if !entry.exited.load(Ordering::Acquire)
-                && let Some(pid) = entry.pid
+                && let Some(pid) = *entry.pid.lock()
             {
                 kill_tree(pid, true);
             }
@@ -645,6 +784,102 @@ impl Drop for ProcessManager {
 
 /// The environment a configuration's process gets on top of the inherited one: `.env`
 /// files, then the configured variables (later wins).
+fn run_followup(
+    root: &Path,
+    config: &RunConfig,
+    cwd: &Path,
+    entry: &Entry,
+    tx: &Sender<Msg>,
+) -> std::io::Result<ExitStatus> {
+    let mut pid = entry.pid.lock();
+    if entry.stopping.load(Ordering::Acquire) {
+        return Err(std::io::Error::other("run stopped after build"));
+    }
+    let inv = invocation(config, cwd);
+    let mut cmd = Command::new(&inv.program);
+    cmd.args(&inv.args).current_dir(cwd).stdout(Stdio::piped()).stderr(Stdio::piped());
+    match config.extras.stdin_file.as_deref() {
+        Some(file) => {
+            cmd.stdin(std::fs::File::open(resolve_cwd(root, Some(Path::new(file))))?);
+        }
+        None => {
+            cmd.stdin(Stdio::piped());
+        }
+    }
+    let env = launch_env(root, config).map_err(|e| std::io::Error::other(e.to_string()))?;
+    apply_env(&mut cmd, &env);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0000_0200 | ide_core::process::CREATE_NO_WINDOW);
+    }
+    (entry.output)(OutputChunk::System { text: format!("{}\n", inv.display) });
+    let mut child = cmd.spawn()?;
+    *pid = Some(child.id());
+    *entry.stdin.lock() = (|| -> std::io::Result<_> {
+        Ok(match child.stdin.take() {
+            Some(pipe) => {
+                #[cfg(unix)]
+                let wait_writable = {
+                    use std::os::fd::AsRawFd;
+                    ide_core::input::nonblocking(pipe.as_raw_fd())?
+                };
+                Some(input_writer(
+                    entry.id,
+                    Box::new(pipe),
+                    #[cfg(unix)]
+                    wait_writable,
+                )?)
+            }
+            None => None,
+        })
+    })()
+    .inspect_err(|_| {
+        let _ = child.kill();
+        let _ = child.wait();
+    })?;
+    drop(pid);
+    let readers = (|| {
+        if let Some(out) = child.stdout.take() {
+            spawn_reader(
+                entry.id,
+                Stream::Stdout,
+                out,
+                tx.clone(),
+                #[cfg(unix)]
+                None,
+            )?;
+        }
+        if let Some(err) = child.stderr.take() {
+            spawn_reader(
+                entry.id,
+                Stream::Stderr,
+                err,
+                tx.clone(),
+                #[cfg(unix)]
+                None,
+            )?;
+        }
+        Ok::<_, std::io::Error>(())
+    })();
+    if let Err(e) = readers {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
+    }
+    child.wait()
+}
+
+pub(crate) fn configure_environment(command: &mut Command, root: &Path, config: &RunConfig) -> IdeResult<()> {
+    apply_env(command, &launch_env(root, config)?);
+    Ok(())
+}
+
 fn launch_env(root: &Path, config: &RunConfig) -> IdeResult<LaunchEnv> {
     let extras = &config.extras;
     let mut vars = if extras.env_files.is_empty() {
@@ -655,7 +890,7 @@ fn launch_env(root: &Path, config: &RunConfig) -> IdeResult<LaunchEnv> {
         let paths: Vec<PathBuf> = extras.env_files.iter().map(|f| resolve_cwd(root, Some(Path::new(f)))).collect();
         crate::envfile::load(&paths, &base).map_err(|e| IdeError::not_found(format!("cannot read .env file: {e}")))?
     };
-    if matches!(config.kind.as_str(), "python" | "pytest")
+    if matches!(config.kind.as_str(), "python" | "pytest" | "django-test")
         && !config.env.contains_key("PYTHONUNBUFFERED")
         && !vars.contains_key("PYTHONUNBUFFERED")
     {
@@ -663,6 +898,23 @@ fn launch_env(root: &Path, config: &RunConfig) -> IdeResult<LaunchEnv> {
     }
     vars.extend(config.env.iter().map(|(k, v)| (k.clone(), v.clone())));
     Ok(LaunchEnv { clear: !extras.include_system_env, vars })
+}
+
+/// What a run inherits with "Include system environment variables" on: this process's
+/// variables and the login shell's ones it lacks.
+pub(crate) fn inherited_env() -> BTreeMap<String, String> {
+    let mut vars = crate::system_env();
+    vars.extend(
+        ide_core::process::shell_env().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))),
+    );
+    vars
+}
+
+pub(crate) fn resolved_env(root: &Path, config: &RunConfig) -> IdeResult<BTreeMap<String, String>> {
+    let env = launch_env(root, config)?;
+    let mut vars = if env.clear { BTreeMap::new() } else { inherited_env() };
+    vars.extend(env.vars);
+    Ok(vars)
 }
 
 fn apply_env(cmd: &mut Command, env: &LaunchEnv) {
@@ -785,6 +1037,7 @@ fn spawn_reader(
     stream: Stream,
     mut pipe: impl Read + Send + 'static,
     tx: Sender<Msg>,
+    #[cfg(unix)] mut wait_readable: Option<Box<dyn FnMut() -> std::io::Result<()> + Send>>,
 ) -> std::io::Result<()> {
     let label = if stream == Stream::Stdout { "out" } else { "err" };
     std::thread::Builder::new().name(format!("openidea-run-{label}-{}", id.0)).spawn(move || {
@@ -798,7 +1051,25 @@ fn spawn_reader(
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    #[cfg(unix)]
+                    if let Some(wait) = &mut wait_readable {
+                        if let Err(e) = wait()
+                            && e.kind() != std::io::ErrorKind::Interrupted
+                        {
+                            tracing::warn!(%id, "run read: {e}");
+                            break;
+                        }
+                        continue;
+                    }
+                    std::thread::sleep(BATCH_INTERVAL);
+                }
+                #[cfg(unix)]
+                Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
+                Err(e) => {
+                    tracing::warn!(%id, "run read: {e}");
+                    break;
+                }
             }
         }
     })?;
@@ -913,6 +1184,19 @@ fn spawn_pump(
         if let Some(pty) = &entry.pty {
             pty.lock().take();
         }
+        // A stopped run is over when the whole process group is gone, not when the child we
+        // spawned exits: a shell or `mvn` can end while the application it started keeps its
+        // port, and reporting "finished" then would let Run start into an occupied port.
+        // A second Stop kills the group, which ends this wait.
+        #[cfg(unix)]
+        if entry.stopping.load(Ordering::Acquire)
+            && let Some(pid) = *entry.pid.lock()
+        {
+            while group_alive(pid, &entry) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        *entry.code.lock() = code;
         entry.exited.store(true, Ordering::Release);
         tracing::debug!(id = %entry.id, ?code, "run exited");
         sink.emit(IdeEvent::RunExited { run: entry.id, code });
@@ -1002,6 +1286,22 @@ fn signal_number(_description: &str) -> Option<i32> {
     None
 }
 
+fn input_writer(
+    id: RunId,
+    writer: Box<dyn std::io::Write + Send>,
+    #[cfg(unix)] wait_writable: impl FnMut() -> std::io::Result<()> + Send + 'static,
+) -> std::io::Result<ide_core::input::InputWriter> {
+    ide_core::input::InputWriter::new(
+        format!("openidea-run-input-{}", id.0),
+        writer,
+        #[cfg(unix)]
+        wait_writable,
+        move |e| {
+            tracing::warn!(%id, "run input: {e}");
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1032,14 +1332,54 @@ mod tests {
         let cwd = dir.path();
         let path = std::env::join_paths([&bin]).unwrap().to_string_lossy().into_owned();
         // Windows environment keys are case-insensitive (`Path`).
-        let env = BTreeMap::from([("Path".to_owned(), path)]);
-        assert_eq!(resolve_program("kotlinc", cwd, &env, true), bin.join("kotlinc.bat"));
+        let config = |env: BTreeMap<String, String>| RunConfig {
+            id: "c".into(),
+            name: "c".into(),
+            kind: "maven".into(),
+            command: String::new(),
+            args: Vec::new(),
+            cwd: None,
+            env,
+            detected: false,
+            is_test: false,
+            debug_adapter: None,
+            allow_parallel: false,
+            extras: Default::default(),
+        };
+        let config = config(BTreeMap::from([("Path".to_owned(), path)]));
+        assert_eq!(resolve_program("kotlinc", cwd, &config, true), bin.join("kotlinc.bat"));
+        // Project wrappers win over an identically named launcher on PATH on Windows only.
+        for name in ["gradlew.bat", "mvnw.cmd"] {
+            std::fs::write(cwd.join(name), "@echo off\n").unwrap();
+            std::fs::write(bin.join(name), "@echo off\n").unwrap();
+            assert_eq!(resolve_program(name, cwd, &config, true), cwd.join(name));
+            assert_eq!(resolve_program(name, cwd, &config, false), bin.join(name));
+            let bare = name.split('.').next().unwrap();
+            assert_eq!(resolve_program(bare, cwd, &config, true), cwd.join(name));
+            assert_eq!(resolve_program(bare, cwd, &config, false), PathBuf::from(bare));
+            std::fs::remove_file(cwd.join(name)).unwrap();
+            std::fs::create_dir(cwd.join(name)).unwrap();
+            assert_eq!(resolve_program(name, cwd, &config, true), bin.join(name));
+            assert_eq!(resolve_program(bare, cwd, &config, true), bin.join(name));
+        }
+        // An extensionless file is not runnable on Windows: only PATHEXT candidates count,
+        // and directories are ignored.
+        std::fs::write(cwd.join("local-tool"), "tool").unwrap();
+        std::fs::write(cwd.join("local-tool.exe"), "tool").unwrap();
+        assert_eq!(resolve_program("local-tool", cwd, &config, true), cwd.join("local-tool.exe"));
+        assert_eq!(resolve_program("local-tool", cwd, &config, false), PathBuf::from("local-tool"));
+        std::fs::remove_file(cwd.join("local-tool")).unwrap();
+        assert_eq!(resolve_program("local-tool", cwd, &config, true), cwd.join("local-tool.exe"));
+        std::fs::remove_file(cwd.join("local-tool.exe")).unwrap();
+        std::fs::create_dir(cwd.join("local-tool")).unwrap();
+        std::fs::create_dir(cwd.join("local-tool.exe")).unwrap();
+        assert_eq!(resolve_program("local-tool", cwd, &config, true), PathBuf::from("local-tool"));
         // Not found: left to the OS (`command not found` at spawn).
-        assert_eq!(resolve_program("nope", cwd, &env, true), PathBuf::from("nope"));
-        // Unix: bare names are left to `execvp`.
-        assert_eq!(resolve_program("kotlinc", cwd, &env, false), PathBuf::from("kotlinc"));
+        assert_eq!(resolve_program("nope", cwd, &config, true), PathBuf::from("nope"));
+        // Unix: extensionless names only (`kotlinc.bat` does not match `kotlinc`).
+        assert_eq!(resolve_program("kotlinc", cwd, &config, false), PathBuf::from("kotlinc"));
         // Relative paths resolve against the run directory on every platform.
-        assert_eq!(resolve_program("./gradlew", cwd, &env, true), cwd.join("./gradlew"));
-        assert_eq!(resolve_program(".venv/bin/python", cwd, &env, false), cwd.join(".venv/bin/python"));
+        assert_eq!(resolve_program("./gradlew", cwd, &config, true), cwd.join("./gradlew"));
+        assert_eq!(resolve_program(".venv/bin/python", cwd, &config, false), cwd.join(".venv/bin/python"));
     }
 }

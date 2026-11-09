@@ -50,7 +50,7 @@ import {
   useWindowProjects,
 } from "./windowProjectList";
 
-const project = (root: string) => ({ root, name: root.split("/").at(-1)!, isGit: false, settings: {} });
+const project = (root: string) => ({ root, name: root.split("/").at(-1)!, isGit: false, trusted: true, settings: {} });
 let off: () => void;
 let calls: string[];
 beforeEach(() => {

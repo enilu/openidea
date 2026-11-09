@@ -4,6 +4,7 @@ import { createMemoryBackend } from "./backend";
 import { initialTabsState } from "./model/tabs";
 import { useDocMeta } from "./model/document";
 import { resetDistractionFree, setDistractionFree } from "@/workbench/distractionFree";
+import { registerTextEditorWrapper } from "@/workbench/contributions";
 import { registerActions } from "@/platform/actions";
 import { useProject } from "@/platform/project";
 import { resolveMenuItems } from "@/ui";
@@ -21,6 +22,51 @@ afterEach(() => {
 });
 
 describe("EditorController", () => {
+  it("autosaves on blur, but not while focus is in a popup over the editor", async () => {
+    const backend = createMemoryBackend({ "/p/a.c": "int main() {\n    \n}\n" });
+    const save = vi.spyOn(backend, "save");
+    ctrl = new EditorController(backend);
+    ctrl.start();
+    await ctrl.openFile("/p/a.c", { focus: false });
+    const slot = ctrl.activeSlot!;
+    const host = document.createElement("div");
+    const popup = document.createElement("div");
+    popup.setAttribute("data-popup", "");
+    const popupList = document.createElement("button");
+    popup.appendChild(popupList);
+    const elsewhere = document.createElement("button");
+    document.body.append(host, popup, elsewhere);
+    try {
+      const view = slot.mount(host);
+      ctrl.onMounted(slot);
+      const type = () => view.dispatch({ changes: { from: 0, insert: "x" }, userEvent: "input.type" });
+      // Into a popup (⌥↵ intentions): nothing is saved while it is open.
+      view.focus();
+      type();
+      popupList.focus();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(save).not.toHaveBeenCalled();
+      // Back to the editor (popup closed): still nothing.
+      view.focus();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(save).not.toHaveBeenCalled();
+      // From the popup elsewhere: saved then.
+      popupList.focus();
+      await new Promise((r) => setTimeout(r, 20));
+      elsewhere.focus();
+      await vi.waitFor(() => expect(save).toHaveBeenCalledTimes(1));
+      // Straight elsewhere: saved.
+      view.focus();
+      type();
+      elsewhere.focus();
+      await vi.waitFor(() => expect(save).toHaveBeenCalledTimes(2));
+    } finally {
+      host.remove();
+      popup.remove();
+      elsewhere.remove();
+    }
+  });
+
   it("leaves modified Enter to a non-text editor after switching from a focused file", async () => {
     ctrl = new EditorController(createMemoryBackend({ "/p/a.ts": "one\ntwo\n" }));
     ctrl.start();
@@ -170,6 +216,33 @@ describe("EditorController", () => {
     expect(pane().tabs.map((t) => t.input.path)).toEqual(["/p/a.ts", "/p/c.ts"]);
   });
 
+  it("carries the plain project's editor tabs into its automatic workspace", async () => {
+    const settings = {};
+    useProject.setState({
+      project: { root: "/attach-a", name: "A", trusted: true, isGit: false, settings },
+      settings,
+      lightEdit: false,
+    });
+    ctrl = new EditorController(createMemoryBackend({ "/attach-a/one.txt": "one", "/attach-a/two.txt": "two" }));
+    ctrl.start();
+    await ctrl.openFile("/attach-a/one.txt", { focus: false, preview: false });
+    await ctrl.openFile("/attach-a/two.txt", { focus: false, preview: false });
+    useProject.setState({
+      project: {
+        root: "/attach-workspace",
+        name: "A",
+        trusted: true,
+        isGit: false,
+        settings,
+        workspace: { version: 1, name: "A", projects: ["/attach-a", "/attach-b"] },
+      },
+    });
+    await vi.waitFor(() =>
+      expect(openFilePaths(useTabs.getState())).toEqual(["/attach-a/one.txt", "/attach-a/two.txt"]),
+    );
+    useProject.setState({ project: null });
+  });
+
   it("reopens the LightEdit files the next time a window switches to LightEdit", async () => {
     ctrl = new EditorController(createMemoryBackend({ "/x/a.txt": "a", "/y/b.md": "b" }));
     ctrl.start();
@@ -190,6 +263,24 @@ describe("EditorController", () => {
     useProject.setState({ lightEdit: false });
   });
 
+  it("opens a file requested while the LightEdit session is being restored", async () => {
+    ctrl = new EditorController(createMemoryBackend({ "/x/a.txt": "a", "/y/b.md": "b", "/z/launch.lua": "l" }));
+    ctrl.start();
+    useProject.setState({ lightEdit: true });
+    await ctrl.openFile("/x/a.txt", { focus: false });
+    await ctrl.openFile("/y/b.md", { focus: false });
+    useProject.setState({ lightEdit: false });
+    // A launch with a file path: LightEdit starts and the file opens before the old tabs are back.
+    useProject.setState({ lightEdit: true });
+    await ctrl.openFile("/z/launch.lua", { focus: false });
+    expect(openFilePaths(useTabs.getState())).toEqual(["/x/a.txt", "/y/b.md", "/z/launch.lua"]);
+    const s = useTabs.getState();
+    const active = s.panes[s.activePane]!;
+    expect(active.tabs.find((t) => t.id === active.active)?.input.path).toBe("/z/launch.lua");
+    await ctrl.closeEverything();
+    useProject.setState({ lightEdit: false });
+  });
+
   it("closes a tab by its input key", async () => {
     ctrl = new EditorController(createMemoryBackend());
     ctrl.start();
@@ -204,7 +295,7 @@ describe("EditorController", () => {
 
   it("builds IDEA's editor tab menu", async () => {
     useProject.setState({
-      project: { name: "p", root: "/p", isGit: true, settings: {} } as never,
+      project: { name: "p", root: "/p", trusted: true, isGit: true, settings: {} } as never,
       settings: {} as never,
     });
     const ids = [
@@ -228,5 +319,23 @@ describe("EditorController", () => {
     expect(items.find((i) => i.label === "Close Tabs to the Right")?.disabled).toBe(false);
     dispose();
     useProject.setState({ project: null, settings: null });
+  });
+
+  it("switches an open image tab to a text tab when a matching text editor wrapper registers", async () => {
+    ctrl = new EditorController(createMemoryBackend({ "/p/arch.diagram.svg": "<svg/>" }));
+    ctrl.start();
+    await ctrl.openInput({ kind: "image", key: "image:/p/arch.diagram.svg", path: "/p/arch.diagram.svg" });
+    expect(openFilePaths(useTabs.getState())).toEqual([]);
+    const offWrapper = registerTextEditorWrapper({
+      id: "plugin.acme.diagram.canvas",
+      matches: (p) => p.endsWith(".diagram.svg"),
+      component: () => null,
+    });
+    try {
+      expect(openFilePaths(useTabs.getState())).toEqual(["/p/arch.diagram.svg"]);
+      await vi.waitFor(() => expect(ctrl?.activeSlot?.model.path).toBe("/p/arch.diagram.svg"));
+    } finally {
+      offWrapper();
+    }
   });
 });

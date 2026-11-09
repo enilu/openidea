@@ -1,7 +1,8 @@
 import { commitRepo } from "./multiRoot";
 /** Create Patch… (from local changes or commits) and Apply Patch… (file or clipboard, with a preview). */
 import { useEffect, useState } from "react";
-import type { Commit, FileStatus, PatchFile, PatchSource } from "@/bindings";
+import type { Commit, FileStatus, PatchFile, PatchSource, ShelvedChangeList } from "@/bindings";
+import { revealInFileManager } from "@/platform/fileManager";
 import { call, commands } from "@/platform/ipc";
 import { Button, Checkbox, Dialog, Icon, Input, List, Spinner, fileIconName, T } from "@/ui";
 import { workflowSettings } from "@/platform/workflowSettings";
@@ -17,7 +18,10 @@ import { currentRepoRoot, useVcs } from "./store";
 import styles from "./common.module.css";
 import { tx } from "@/platform/i18n";
 
-export type PatchOrigin = { kind: "changes"; files: FileStatus[] } | { kind: "commits"; commits: Commit[] };
+export type PatchOrigin =
+  | { kind: "changes"; files: FileStatus[] }
+  | { kind: "commits"; commits: Commit[] }
+  | { kind: "shelf"; entry: ShelvedChangeList; path?: string };
 
 /** File name IDEA suggests: the change list or commit subject, sanitised. */
 export function suggestedPatchName(origin: PatchOrigin, listName: string): string {
@@ -26,7 +30,9 @@ export function suggestedPatchName(origin: PatchOrigin, listName: string): strin
       ? origin.commits.length === 1
         ? origin.commits[0]!.summary
         : `${origin.commits.length} commits`
-      : listName;
+      : origin.kind === "shelf"
+        ? origin.entry.name
+        : listName;
   const clean = base
     .replace(/[^\p{L}\p{N}._-]+/gu, "_")
     .replace(/^_+|_+$/g, "")
@@ -43,9 +49,28 @@ export function showCreatePatchForChanges(paths?: readonly string[]) {
   openDialog((close) => <CreatePatchDialog origin={{ kind: "changes", files }} onClose={close} />);
 }
 
+/** Copy as Patch to Clipboard: the selected local changes, without a dialog. */
+export async function copyChangesAsPatch(paths: readonly string[]) {
+  const files = defaultChangeFiles(paths);
+  if (!files.length) return;
+  await saveAll();
+  await runOp(
+    tx("Create patch"),
+    async () => {
+      const source: PatchSource = { from: "changes", paths: files.map((f) => stripSlash(f.path)), reverse: false };
+      await navigator.clipboard.writeText(await call(commands.vcsCreatePatch(currentRepoRoot(), source)));
+    },
+    { success: "Patch copied to the clipboard", refresh: false },
+  );
+}
+
 export function showCreatePatchForCommits(commits: Commit[]) {
   if (!commits.length) return;
   openDialog((close) => <CreatePatchDialog origin={{ kind: "commits", commits }} onClose={close} />);
+}
+
+export function showCreatePatchForShelf(entry: ShelvedChangeList, path?: string) {
+  openDialog((close) => <CreatePatchDialog origin={{ kind: "shelf", entry, path }} onClose={close} />);
 }
 
 async function browseSave(current: string): Promise<string | null> {
@@ -72,7 +97,7 @@ async function afterPatchSaved(path: string) {
     if (r.checked) await rememberSetting("vcs.confirmation.onPatchCreated", show ? "reveal" : "no");
     if (!show) return;
   }
-  void import("@tauri-apps/plugin-opener").then((m) => m.revealItemInDir(path)).catch(() => undefined);
+  void revealInFileManager(path).catch(() => undefined);
 }
 
 function CreatePatchDialog({ origin, onClose }: { origin: PatchOrigin; onClose: () => void }) {
@@ -92,22 +117,27 @@ function CreatePatchDialog({ origin, onClose }: { origin: PatchOrigin; onClose: 
     if (empty || (toFile && !file.trim())) return;
     onClose();
     await saveAll();
-    const source: PatchSource =
-      origin.kind === "changes"
-        ? {
-            from: "changes",
-            paths: origin.files.filter((f) => selected.has(f.path)).map((f) => stripSlash(f.path)),
-            reverse,
-          }
-        : {
-            from: "commits",
-            commits: [...origin.commits].sort((a, b) => (a.timeMs ?? 0) - (b.timeMs ?? 0)).map((c) => c.id),
-            reverse,
-          };
+    const source: PatchSource | null =
+      origin.kind === "shelf"
+        ? null
+        : origin.kind === "changes"
+          ? {
+              from: "changes",
+              paths: origin.files.filter((f) => selected.has(f.path)).map((f) => stripSlash(f.path)),
+              reverse,
+            }
+          : {
+              from: "commits",
+              commits: [...origin.commits].sort((a, b) => (a.timeMs ?? 0) - (b.timeMs ?? 0)).map((c) => c.id),
+              reverse,
+            };
     const done = await runOp(
-      "Create patch",
+      tx("Create patch"),
       async () => {
-        const patch = await call(commands.vcsCreatePatch(repo, source));
+        const patch =
+          origin.kind === "shelf"
+            ? await call(commands.vcsShelfPatch(origin.entry.id, origin.path ?? null))
+            : await call(commands.vcsCreatePatch(repo, source!));
         if (toFile) await call(commands.vcsWritePatch(file.trim(), patch));
         else await navigator.clipboard.writeText(patch);
         return true;
@@ -134,6 +164,8 @@ function CreatePatchDialog({ origin, onClose }: { origin: PatchOrigin; onClose: 
           </div>
           <FileChecklist files={origin.files} selected={selected} onChange={setSelected} label="Files to include" />
         </>
+      ) : origin.kind === "shelf" ? (
+        <div className={styles.section}>{origin.path ?? origin.entry.name}</div>
       ) : (
         <div className={styles.section}>
           {origin.commits.length === 1
@@ -167,7 +199,7 @@ function CreatePatchDialog({ origin, onClose }: { origin: PatchOrigin; onClose: 
             <T>Copy to clipboard</T>
           </span>
         </label>
-        <Checkbox checked={reverse} onChange={setReverse} label="Reverse patch" />
+        {origin.kind !== "shelf" && <Checkbox checked={reverse} onChange={setReverse} label="Reverse patch" />}
       </div>
     </Dialog>
   );
@@ -234,7 +266,7 @@ function ApplyPatchDialog({ patch, source, onClose }: { patch: string; source: s
   const run = async () => {
     onClose();
     await saveAll();
-    const outcome = await runOp(`Apply patch (${source})`, () => call(commands.vcsApplyPatch(repo, patch)), {
+    const outcome = await runOp(tx`Apply patch (${source})`, () => call(commands.vcsApplyPatch(repo, patch)), {
       refresh: false,
     });
     if (outcome) await reportApply(outcome, "Patch applied");
@@ -289,7 +321,7 @@ function ApplyPatchDialog({ patch, source, onClose }: { patch: string; source: s
                   f.applies ? tx("Applies cleanly") : tx("Does not apply cleanly: a 3-way merge will be attempted")
                 }
               >
-                <Icon name={fileIconName(baseName(f.path))} size={14} />
+                <Icon name={fileIconName(baseName(f.path), f.path)} size={14} />
                 <span
                   className={styles.fileName}
                   style={{

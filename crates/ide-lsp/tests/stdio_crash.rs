@@ -3,7 +3,7 @@
 #![cfg(unix)]
 
 use ide_core::event::ServerStatus;
-use ide_core::{DocId, IdeEvent, LanguageId};
+use ide_core::{CancellationToken, DocId, IdeEvent, LanguageId};
 use ide_language::{LanguageConfig, LanguageRegistry, LanguageServerConfig};
 use ide_lsp::{LspManager, ProcessLauncher};
 use parking_lot::Mutex;
@@ -64,4 +64,92 @@ async fn crash_before_the_handshake_reports_what_the_server_printed() {
     // The stdout prompt, decoded (code page 936 on Windows, lossily elsewhere).
     assert!(message.contains(". . ."), "{message}");
     mgr.shutdown_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_that_needs_a_crashed_jdtls_reports_why_it_crashed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let script = root.join("fake-jdtls");
+    std::fs::write(&script, LAUNCHER).unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+    let server: LanguageServerConfig =
+        toml::from_str(&format!("name = \"jdtls\"\ncommand = {:?}", script.to_string_lossy())).unwrap();
+    let lang: LanguageConfig = toml::from_str("id = \"java\"\nname = \"Java\"\nextensions = [\"java\"]").unwrap();
+    let lang = LanguageConfig { language_servers: vec![server], ..lang };
+    let registry = Arc::new(LanguageRegistry::from_configs(vec![lang]));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = {
+        let events = events.clone();
+        Arc::new(move |e: IdeEvent| events.lock().push(e))
+    };
+    let mgr = LspManager::with_launcher(root.clone(), registry, sink, Arc::new(ProcessLauncher));
+    let path = root.join("A.java");
+    std::fs::write(&path, "class A {}\n").unwrap();
+    mgr.did_open(DocId::next(), &path, &LanguageId::new("java"), 1, "class A {}\n");
+    for _ in 0..1000 {
+        let crashed =
+            events.lock().iter().any(|e| matches!(e, IdeEvent::LanguageServer { status: ServerStatus::Crashed, .. }));
+        if crashed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let error = mgr.java_classpath(&path, false, &CancellationToken::new()).await.unwrap_err();
+    assert!(error.message.contains("jdtls exited with code 1"), "{}", error.message);
+    assert!(error.message.contains("'python' is not recognized"), "{}", error.message);
+    mgr.shutdown_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn target_launch_failure_shows_exact_argv_and_stderr_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dunce::canonicalize(dir.path()).unwrap();
+    let wrapper = root.join("target wrapper");
+    std::fs::write(&wrapper, "#!/bin/sh\ni=0\nwhile [ $i -lt 60 ]; do echo stderr-$i >&2; i=$((i+1)); done\nexit 37\n")
+        .unwrap();
+    std::fs::set_permissions(&wrapper, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let mut server: LanguageServerConfig = toml::from_str("name='target-ls'\ncommand='unused'").unwrap();
+    server.command = wrapper.to_string_lossy().into_owned();
+    server.args = vec!["literal prefix".into(), "--cwd=/container".into(), "missing-lsp".into()];
+    server.pinned = Some(ide_language::ProgramPin::approve(&wrapper).unwrap());
+    server.target = Some(ide_language::ServerTarget {
+        id: "test-target".into(),
+        origin: None,
+        project_root: root.clone(),
+        container_root: "/container".into(),
+        mapping: ide_core::path_mapping::PathMapping::new(&root.to_string_lossy(), "/container"),
+    });
+    let expected =
+        format!("argv: {:?}", std::iter::once(&server.command).chain(server.args.iter()).collect::<Vec<_>>());
+    let mut language: LanguageConfig = toml::from_str("id='mock'\nname='Mock'\nextensions=['mock']").unwrap();
+    language.language_servers = vec![server];
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink_events = events.clone();
+    let manager = LspManager::new(
+        root.clone(),
+        Arc::new(LanguageRegistry::from_configs(vec![language])),
+        Arc::new(move |event: IdeEvent| sink_events.lock().push(event)),
+    );
+    manager.did_open(DocId::next(), &root.join("main.mock"), &LanguageId::new("mock"), 1, "x");
+    let message = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(message) = events.lock().iter().find_map(|event| match event {
+                IdeEvent::LanguageServer { status: ServerStatus::Crashed, message, .. } => message.clone(),
+                _ => None,
+            }) {
+                break message;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(message.contains("exited with code 37"), "{message}");
+    assert!(message.contains("stderr-59"), "{message}");
+    assert!(message.contains(&expected), "{message}");
+    assert!(!message.contains("stderr-0\n"), "{message}");
+    manager.shutdown_all().await;
 }

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
+import { setDiagnostics } from "@codemirror/lint";
 import type { CodeAction } from "@/bindings";
 
 const resolved: CodeAction = {
@@ -22,19 +23,27 @@ const resolved: CodeAction = {
   data: null,
   server: 1,
 };
+const lspCodeActions = vi.fn();
+const lspApplyCodeAction = vi.fn();
 const lspResolveCodeAction = vi.fn(async () => ({ status: "ok" as const, data: resolved }));
 vi.mock("@/platform/ipc", async (orig) => {
   const actual = await orig<typeof import("@/platform/ipc")>();
-  return { ...actual, isTauri: () => true, commands: { ...actual.commands, lspResolveCodeAction } };
+  return {
+    ...actual,
+    isTauri: () => true,
+    commands: { ...actual.commands, lspResolveCodeAction, lspCodeActions, lspApplyCodeAction },
+  };
 });
 
 const {
+  applyKindSilently,
   bulbLine,
   changedLines,
   indentUnderBrace,
   intentionPreview,
   lightsBulb,
   listedCodeActions,
+  listedIntentions,
   withInspectionControls,
 } = await import("./intentions");
 const { setFileDiagnostics } = await import("./diagnostics");
@@ -90,9 +99,72 @@ describe("inspection controls in ⌥↵ (issue #42)", () => {
     setFileDiagnostics("/p/two.py", "ruff", []);
     expect(withInspectionControls(view, [])).toEqual([]);
   });
+
+  it.each(["info", "warning", "error"] as const)(
+    "uses the effective %s severity for local and LSP fixes",
+    (severity) => {
+      const path = `/p/severity-${severity}.py`;
+      setFileDiagnostics(path, "ruff", [{ ...unused, severity }]);
+      const view = editorAt(path);
+      view.dispatch(setDiagnostics(view.state, [{ from: 7, to: 9, severity, message: unused.message }]));
+      const items = listedIntentions(view, [
+        { id: "refactor", label: "Extract method", icon: "bulb", run: vi.fn() },
+        { id: "local", label: "Local fix", quickFix: true, run: vi.fn() },
+        { id: "lsp", label: "LSP fix", quickFix: true, emphasis: true, run: vi.fn() },
+      ]);
+      expect(items.map((i) => i.id)).toEqual(["lsp", "local", "refactor"]);
+      expect(items.slice(0, 2).map((i) => i.icon)).toEqual(Array(2).fill(severity === "error" ? "bulb-fix" : "bulb"));
+      const controls = withInspectionControls(view, items);
+      expect(controls.slice(0, 2).every((i) => i.submenu?.length === 2)).toBe(true);
+      expect(controls[2]!.submenu).toBeUndefined();
+      setFileDiagnostics(path, "ruff", []);
+    },
+  );
+});
+
+describe("silent code actions", () => {
+  it("does not run lazy plugin actions that could prompt during Actions on Save", async () => {
+    const view = new EditorView({
+      state: EditorState.create({
+        doc: "f(1);",
+        extensions: [lspDoc.of({ doc: 1, path: "/p/a.ts", language: "typescript", uiMode: null, readOnly: false })],
+      }),
+    });
+    views.push(view);
+    lspCodeActions.mockResolvedValueOnce({
+      status: "ok",
+      data: [{ ...resolved, kind: "source.fixAll", server: 0, edit: null }],
+    });
+    expect(await applyKindSilently(view, "source.fixAll")).toBe(false);
+    expect(lspApplyCodeAction).not.toHaveBeenCalled();
+    expect(lspResolveCodeAction).not.toHaveBeenCalled();
+  });
 });
 
 describe("intention preview", () => {
+  it("does not resolve lazy plugin actions while previewing", async () => {
+    const view = new EditorView({
+      state: EditorState.create({
+        doc: "f(1);",
+        extensions: [lspDoc.of({ doc: 1, path: "/p/a.ts", language: "typescript", uiMode: null, readOnly: false })],
+      }),
+    });
+    views.push(view);
+    const cache = new Map<CodeAction, Promise<CodeAction>>();
+    const preview = await intentionPreview(
+      view,
+      { ...resolved, server: 0, edit: null },
+      cache,
+      new AbortController().signal,
+    );
+    expect(preview).toEqual({ kind: "text", text: "Preview isn't available for this action" });
+    expect(lspResolveCodeAction).not.toHaveBeenCalled();
+    expect(cache.size).toBe(0);
+    expect(await intentionPreview(view, { ...resolved, server: 0 }, cache, new AbortController().signal)).toMatchObject(
+      { kind: "diff" },
+    );
+  });
+
   it("resolves the action once and shows its diff for this file", async () => {
     const view = new EditorView({
       state: EditorState.create({

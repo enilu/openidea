@@ -3,6 +3,7 @@
  * contract between features (which register actions) and keymaps.
  */
 export const intellijMacos: Record<string, string[]> = {
+  "editor.addOrRemoveCaret": ["Alt+Shift+Button1"],
   // Navigate
   "navigate.searchEverywhere": ["Shift Shift"],
   "navigate.gotoClass": ["Meta+O"],
@@ -15,11 +16,11 @@ export const intellijMacos: Record<string, string[]> = {
   "navigate.switcherBack": ["Ctrl+Shift+Tab"],
   "navigate.recentFiles": ["Meta+E"],
   "navigate.recentLocations": ["Meta+Shift+E"],
-  "navigate.back": ["Meta+[", "Meta+Alt+Left", "Button4"],
-  "navigate.forward": ["Meta+]", "Meta+Alt+Right", "Button5"],
+  "navigate.back": ["Meta+[", "Meta+Alt+Left", "Button4", "SwipeRight"],
+  "navigate.forward": ["Meta+]", "Meta+Alt+Right", "Button5", "SwipeLeft"],
   "navigate.gotoLine": ["Meta+L"],
   "navigate.declaration": ["Meta+B"],
-  "navigate.implementation": ["Meta+Alt+B"],
+  "navigate.implementation": ["Meta+Alt+B", "Meta+Alt+Button1"],
   "navigate.typeDeclaration": ["Meta+Shift+B", "Ctrl+Shift+B"],
   "navigate.fileStructure": ["Meta+F12"],
   "navigate.nextError": ["F2"],
@@ -170,10 +171,13 @@ export const intellijMacos: Record<string, string[]> = {
   "refactor.inline": ["Meta+Alt+N"],
   "refactor.move": ["F6"],
   "refactor.safeDelete": ["Meta+Delete"],
+  "refactor.pullMembersUp": [],
+  "refactor.pushMembersDown": [],
 
   // File / editor tabs
   "file.save": ["Meta+S"],
   "file.settings": ["Meta+,"],
+  "file.projectStructure": ["Meta+;"],
   "file.openProject": ["Meta+Shift+Alt+O"],
   "file.newScratchFile": ["Meta+Shift+N"],
   "editor.closeTab": ["Meta+W"],
@@ -186,11 +190,14 @@ export const intellijMacos: Record<string, string[]> = {
   "editor.nextSplitter": ["Alt+Tab"],
   "editor.prevSplitter": ["Alt+Shift+Tab"],
   "window.toggleFullScreen": ["Meta+Ctrl+F"],
+  "window.nextTab": ["Meta+Alt+PageDown"],
+  "window.previousTab": ["Meta+Alt+PageUp"],
   "window.next": ["Meta+Alt+`"],
   "window.previous": ["Meta+Alt+Shift+`"],
   "file.reloadFromDisk": ["Meta+Alt+Y"],
   // Before the project view's ⇧⌘C (Copy Absolute Path), which wins there.
-  "editor.copyPath": ["Meta+Shift+C"],
+  "editor.copyPath": [],
+  "editor.copyPathReference": ["Meta+Shift+C"],
 
   // Project view (when: projectViewFocus)
   "project.newFile": ["Meta+N"],
@@ -254,6 +261,7 @@ export const intellijMacos: Record<string, string[]> = {
   "run.debugContext": ["Ctrl+Shift+D"],
   "run.stop": ["Meta+F2"],
   "workbench.stopBackgroundProcesses": ["Meta+Shift+F2"],
+  "run.updateApplication": ["Meta+F10"],
   // Rerun in the Run / Debug tool window only (when / keyWhen); Meta+R stays with the editor elsewhere.
   "run.rerun": ["Meta+R"],
   "coverage.manageReports": ["Meta+Alt+F6"],
@@ -281,7 +289,7 @@ export const intellijMacos: Record<string, string[]> = {
   "debug.setValue": ["F2"],
   "debug.jumpToSource": ["F4", "Meta+Down"],
   "debug.evaluate": ["Alt+F8"],
-  "debug.quickEvaluate": ["Meta+Alt+F8"],
+  "debug.quickEvaluate": ["Meta+Alt+F8", "Alt+Button1"],
   "debug.browseConsoleHistory": ["Meta+Alt+E"],
 
   // VCS
@@ -293,6 +301,7 @@ export const intellijMacos: Record<string, string[]> = {
   "vcs.showMessageHistory": ["Ctrl+M"],
   "vcs.update": ["Meta+T"],
   "vcs.rollback": ["Meta+Alt+Z"],
+  "vcs.addToVcs": ["Meta+Alt+A"],
   "vcs.showDiff": ["Meta+D"],
   "vcs.nextChange": ["Ctrl+Alt+Shift+Down"],
   "vcs.prevChange": ["Ctrl+Alt+Shift+Up"],
@@ -343,8 +352,13 @@ export const intellijMacos: Record<string, string[]> = {
   "markdown.previewOnly": [],
   // HTTP Client / Database console: run the request or statement at the caret.
   "http.runRequest": ["Meta+Enter"],
+  "graphql.runQuery": ["Meta+Enter"],
   "http.runAll": [],
   "db.execute": ["Meta+Enter"],
+  // Table editor with pending changes (after `vcs.rollback`, so ⌥⌘Z reverts the table's edits there).
+  "db.goToColumn": ["Meta+F12"],
+  "db.submitChanges": ["Meta+Enter"],
+  "db.revertChanges": ["Meta+Alt+Z"],
   "db.showToolWindow": [],
   "agents.newTask": ["Meta+Shift+I"],
   "agents.showToolWindow": [],
@@ -354,6 +368,12 @@ export const intellijMacos: Record<string, string[]> = {
   "db.newDataSource": [],
   "db.new": ["Meta+N"],
   "services.addService": ["Meta+N"],
+  // Pull Requests tool window (Create in its title bar, Refresh per tab) and the review's viewed toggle.
+  "github.createPullRequest": ["Meta+N"],
+  "github.refresh": ["Meta+R"],
+  "github.pullRequest.refresh": ["Meta+R"],
+  "github.pullRequest.timeline.refresh": ["Meta+R"],
+  "github.pullRequest.toggleViewed": ["Meta+Shift+S"],
   "db.properties": ["Shift+Enter"],
   "db.refresh": ["Meta+R"],
   "db.disconnect": ["Meta+F2"],
@@ -387,6 +407,9 @@ export const intellijMacos: Record<string, string[]> = {
   "find.popup.openResult": ["F4", "Meta+Down"],
   "find.popup.recentSearches": ["Alt+Down"],
   // Search fields (find bar, Find in Files): last, so they win over editor keys while one is focused.
+  "find.openInWindow": ["Alt+F7"],
   "find.field.newLine": ["Meta+Shift+Enter"],
   "find.field.recentSearches": ["Alt+Down"],
+  "editor.pasteHistory.paste": ["Enter"],
+  "editor.pasteHistory.remove": ["Delete", "Backspace"],
 };

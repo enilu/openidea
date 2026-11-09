@@ -1,7 +1,8 @@
 /** Call / type hierarchy state, with lazily expanded levels. */
 import { create } from "zustand";
-import type { HierarchyDirection, HierarchyItem, OutlineItem, Pos, SymbolKind } from "@/bindings";
-import { IpcError, call, commands } from "@/platform/ipc";
+import type { HierarchyDirection, HierarchyItem, OutlineItem, Pos, RequestId, SymbolKind } from "@/bindings";
+import { incompleteNote } from "@/editor/lsp/lsp";
+import { IpcError, call, commands, nextRequestId } from "@/platform/ipc";
 import { toolWindowService } from "@/workbench/contributions";
 import { basename } from "@/platform/project";
 import { caretContext, hint, lspRequest, reportError, withDocument, type CaretContext } from "./ipc";
@@ -12,6 +13,8 @@ export type HierarchyMode = "call" | "type";
 export interface HierarchyNode {
   id: string;
   item: HierarchyItem;
+  /** Set when the node repeats an ancestor: it is kept a leaf and marked "recursive". */
+  recursion?: boolean;
 }
 
 export interface HierarchyRoot {
@@ -29,6 +32,8 @@ interface HierarchyState {
   children: ReadonlyMap<string, HierarchyNode[]>;
   /** Parent ids whose children failed to load. */
   failed: ReadonlySet<string>;
+  /** Parent id → why its children may be missing callers. */
+  notes: ReadonlyMap<string, string>;
   loading: boolean;
   /** Bumped per (re)query so stale responses are dropped and the tree resets. */
   generation: number;
@@ -42,16 +47,27 @@ export const useHierarchy = create<HierarchyState>(() => ({
   root: null,
   children: new Map(),
   failed: new Set(),
+  notes: new Map(),
   loading: false,
   generation: 0,
 }));
 
+/** Call hierarchy requests the current tree still waits for. */
+const inflight = new Set<RequestId>();
+
+function cancelInflight() {
+  for (const request of inflight) void commands.cancelRequest(request).catch(() => {});
+  inflight.clear();
+}
+
 /** The window switched projects: the tree refers to the previous one's documents. */
 export function resetHierarchy() {
+  cancelInflight();
   useHierarchy.setState((s) => ({
     root: null,
     children: new Map(),
     failed: new Set(),
+    notes: new Map(),
     loading: false,
     generation: s.generation + 1,
   }));
@@ -74,12 +90,18 @@ export function hierarchyTitle(mode: HierarchyMode, direction: HierarchyDirectio
   return direction === "incoming" ? tx`Supertypes of ${name}` : tx`Subtypes of ${name}`;
 }
 
-function request(mode: HierarchyMode, doc: number, line: number, col: number, direction: HierarchyDirection) {
-  return lspRequest(() =>
-    mode === "call"
-      ? commands.lspCallHierarchy(doc, { line, col }, direction)
-      : commands.lspTypeHierarchy(doc, { line, col }, direction),
-  );
+async function request(mode: HierarchyMode, doc: number, line: number, col: number, direction: HierarchyDirection) {
+  if (mode === "type") {
+    const items = await lspRequest(() => commands.lspTypeHierarchy(doc, { line, col }, direction));
+    return { items, incomplete: null };
+  }
+  const id = nextRequestId();
+  inflight.add(id);
+  try {
+    return await lspRequest(() => commands.lspCallHierarchy(id, doc, { line, col }, direction));
+  } finally {
+    inflight.delete(id);
+  }
 }
 
 export function childId(parent: string, item: HierarchyItem): string {
@@ -87,18 +109,51 @@ export function childId(parent: string, item: HierarchyItem): string {
   return `${parent}/${item.path}:${p.line}:${p.col}:${item.name}`;
 }
 
-function setChildren(generation: number, parent: string, items: HierarchyItem[]) {
+/** Position-unique key of a hierarchy item: the same symbol always has the same one. */
+function itemKey(item: HierarchyItem): string {
+  const p = item.selectionRange.start;
+  return `${item.path}:${p.line}:${p.col}:${item.name}`;
+}
+
+/** The root's key, matching itemKey of the item its position resolves to. */
+function rootKey(root: HierarchyRoot): string {
+  return `${root.path}:${root.line}:${root.col}:${root.name}`;
+}
+
+/** Each node's position key plus its ancestors', so a child repeating one is a cycle. */
+const nodeKeys = new WeakMap<HierarchyNode, readonly string[]>();
+
+function setChildren(
+  generation: number,
+  parent: string,
+  parentKeys: readonly string[],
+  items: HierarchyItem[],
+  note: string | null,
+) {
   const s = useHierarchy.getState();
   if (s.generation !== generation) return;
+  const ancestors = new Set(parentKeys);
   const seen = new Set<string>();
   const nodes: HierarchyNode[] = [];
+  const children = new Map(s.children);
+  children.set(parent, nodes);
   for (const item of items) {
     const id = childId(parent, item);
     if (seen.has(id)) continue;
     seen.add(id);
-    nodes.push({ id, item });
+    const key = itemKey(item);
+    // A recursive symbol arrives with a fresh id on every level (the id carries the
+    // parent chain); only its position key reveals the cycle. Keep such a node a
+    // leaf — expanding it again would request the same level forever.
+    const node: HierarchyNode = ancestors.has(key) ? { id, item, recursion: true } : { id, item };
+    if (node.recursion) children.set(id, []);
+    nodeKeys.set(node, [...parentKeys, key]);
+    nodes.push(node);
   }
-  useHierarchy.setState({ children: new Map(s.children).set(parent, nodes) });
+  useHierarchy.setState({
+    children,
+    ...(note ? { notes: new Map(s.notes).set(parent, note) } : {}),
+  });
 }
 
 type RootResult = "loaded" | "noTarget" | "failed" | "stale";
@@ -109,10 +164,13 @@ async function loadRoot(quiet = false): Promise<RootResult> {
   const root = s.root;
   if (!root) return "stale";
   const generation = s.generation + 1;
-  useHierarchy.setState({ generation, children: new Map(), failed: new Set(), loading: true });
+  cancelInflight();
+  useHierarchy.setState({ generation, children: new Map(), failed: new Set(), notes: new Map(), loading: true });
   try {
-    const items = await withDocument(root.path, (doc) => request(s.mode, doc, root.line, root.col, s.direction));
-    setChildren(generation, ROOT_ID, items);
+    const { items, incomplete } = await withDocument(root.path, (doc) =>
+      request(s.mode, doc, root.line, root.col, s.direction),
+    );
+    setChildren(generation, ROOT_ID, [rootKey(root)], items, incomplete && incompleteNote(incomplete, root.name));
     return "loaded";
   } catch (e) {
     if (useHierarchy.getState().generation !== generation) return "stale";
@@ -160,8 +218,16 @@ export async function loadChildren(node: HierarchyNode) {
   const { mode, direction, generation } = useHierarchy.getState();
   const at = node.item.selectionRange.start;
   try {
-    const items = await withDocument(node.item.path, (doc) => request(mode, doc, at.line, at.col, direction));
-    setChildren(generation, node.id, items);
+    const { items, incomplete } = await withDocument(node.item.path, (doc) =>
+      request(mode, doc, at.line, at.col, direction),
+    );
+    setChildren(
+      generation,
+      node.id,
+      nodeKeys.get(node) ?? [],
+      items,
+      incomplete && incompleteNote(incomplete, node.item.name),
+    );
   } catch (e) {
     if (useHierarchy.getState().generation !== generation) return;
     useHierarchy.setState((st) => ({

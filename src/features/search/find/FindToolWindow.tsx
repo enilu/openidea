@@ -1,9 +1,10 @@
+import { menuGroupItems } from "@/workbench/contributions";
 import { useMemo, useRef, useState, type KeyboardEvent } from "react";
 import clsx from "clsx";
 import { create } from "zustand";
 import { executeAction } from "@/platform/actions";
 import type { FileMatches } from "@/platform/ipc";
-import { shortcutLabel } from "@/platform/keymap";
+import { formatBinding, hostBinding, shortcutLabel } from "@/platform/keymap";
 import {
   Button,
   EmptyState,
@@ -24,6 +25,7 @@ import {
 import { notifications, useOccurrenceNavigator } from "@/workbench/contributions";
 import { confirm } from "@/workbench/messages";
 import { basename, openLocation, relDir } from "../common/open";
+import { countFileMatches } from "./session";
 import { CodePreview, MatchText, type PreviewHighlight } from "./parts";
 import {
   NO_MARKS,
@@ -52,7 +54,7 @@ import {
   type FindTab,
 } from "./windowStore";
 import styles from "./FindToolWindow.module.css";
-import { tx } from "@/platform/i18n";
+import { t, tx } from "@/platform/i18n";
 
 type Node =
   | { kind: "dir"; key: string; label: string; count: number; children: Node[] }
@@ -104,18 +106,19 @@ export function buildFindTree(files: readonly FileMatches[], groupByDirectory = 
         starts: m.ranges.map(([s]) => ({ line: m.line, col: s + m.textOffset })),
       };
     });
+    const count = countFileMatches(f);
     const file: Node = {
       kind: "file",
       key: `f:${f.path}`,
       path: f.path,
       name: basename(f.relPath),
       dir,
-      count: f.matches.length,
+      count,
       children,
     };
     if (d) {
       d.children.push(file);
-      d.count += f.matches.length;
+      d.count += count;
     } else flat.push(file);
   }
   if (!groupByDirectory) {
@@ -203,7 +206,7 @@ export function FindToolWindow() {
   if (!tab) {
     return (
       <EmptyState title="No search results" icon="search">
-        {tx`Use Find in Files (${shortcutLabel("find.inPath") ?? "⇧⌘F"}) and choose “Open in Find Window”.`}
+        {tx`Use Find in Files (${shortcutLabel("find.inPath") ?? formatBinding(hostBinding("Meta+Shift+F"))}) and choose “Open in Find Window”.`}
       </EmptyState>
     );
   }
@@ -374,8 +377,10 @@ function FindTabView({ tab }: { tab: FindTab }) {
             ? (st.error ?? tx("Search failed"))
             : progress
               ? tx`Replacing… ${progress.done}/${progress.total} files`
-              : tx`${`${st.matchCount}${st.summary?.limitHit ? "+" : ""}`} matches in ${st.files.length} files` +
-                (marks.excluded.size ? ` · ${tx`${marks.excluded.size} excluded`}` : "")}
+              : t(st.summary?.limitHit ? "search.find.matchesIncomplete" : "search.find.matches", {
+                  matches: st.matchCount,
+                  files: st.files.length,
+                }) + (marks.excluded.size ? ` · ${tx`${marks.excluded.size} excluded`}` : "")}
         </span>
         <span className={styles.spacer} />
         <Button size="small" variant="ghost" disabled={!selection.size} onClick={exclude} title="Exclude / include (⌫)">
@@ -434,6 +439,12 @@ function FindTabView({ tab }: { tab: FindTab }) {
             onSelectionChange={(next, lead) => {
               setSelection(next);
               setLeadNode(lead);
+              if (tab.editorResults && lead?.kind === "match")
+                void openLocation(
+                  lead.path,
+                  { line: lead.line, col: lead.col, endLine: lead.line, endCol: lead.endCol },
+                  { focus: false },
+                );
             }}
             multiSelect
             onActivate={(n) => {
@@ -449,6 +460,9 @@ function FindTabView({ tab }: { tab: FindTab }) {
               const groups = [...sel].flatMap((k) => (byKey.get(k) ? nodeGroups(byKey.get(k)!) : []));
               const excludedAll = groups.length > 0 && groups.every((g) => groupState(g, marks) === "excluded");
               showContextMenu(e, [
+                ...(_n?.kind === "match"
+                  ? menuGroupItems("searchResults", { paths: [_n.path], line: _n.line, column: _n.col })
+                  : []),
                 {
                   id: "exclude",
                   label: excludedAll ? "Include" : "Exclude",
@@ -535,7 +549,6 @@ function FindNodeContent({ node, state, tab }: { node: Node; state: TreeRowState
               text={node.text}
               ranges={node.ranges}
               source={{ path: node.path, line: node.line, col: node.textCol }}
-              active={state.selected}
               replacement={tab.replacement}
               query={tab.query}
               preserveCase={!!tab.preserveCase}

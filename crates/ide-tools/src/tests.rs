@@ -37,10 +37,75 @@ impl Env {
         fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
         archive::make_executable(&p).unwrap();
     }
+
+    #[cfg(windows)]
+    fn script(&self, dir: &Path, name: &str, body: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join(format!("{name}.cmd")), format!("@echo off\r\n{body}\r\n")).unwrap();
+    }
 }
 
 fn find<'a>(list: &'a [ToolInfo], name: &str) -> &'a ToolInfo {
     list.iter().find(|t| t.name == name).unwrap_or_else(|| panic!("{name} not listed"))
+}
+
+#[test]
+fn bundled_lombok_replaces_legacy_installs_on_every_platform_without_downloads() {
+    for os in [Os::Mac, Os::Linux, Os::Windows] {
+        for arch in [platform::Arch::Arm64, platform::Arch::X64] {
+            let env = Env::new();
+            let legacy = env.root.join("lombok/bin/lombok.jar");
+            fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            fs::write(&legacy, b"old official agent").unwrap();
+            fs::write(env.root.join("lombok").join(MANIFEST), r#"{"version":"1.18.48"}"#).unwrap();
+            let previous = env.root.join("lombok/bin/lombok-1.18.48-openidea.2.jar");
+            fs::write(&previous, b"previous bundled agent").unwrap();
+            let tools = Tools::with_paths(env.root.clone(), OsString::new(), Platform { os, arch });
+            let info = tools.info("lombok", &[]).unwrap();
+            let path = managed_bundle(env.root.parent().unwrap(), "lombok").unwrap();
+            assert_eq!(info.status, ToolStatus::Installed);
+            assert_eq!(info.version.as_deref(), Some("1.18.48-openidea.3"));
+            assert_eq!(info.path, Some(path.clone().into()));
+            assert_eq!(path.file_name().unwrap(), "lombok-1.18.48-openidea.3.jar");
+            assert!(!info.can_install && !info.can_uninstall);
+            assert_eq!(tools.unavailable_reason(registry::find("lombok").unwrap()), None);
+            assert_eq!(fs::read(&legacy).unwrap(), b"old official agent", "other windows may still use it");
+            assert_ne!(path, previous, "new agent path must invalidate the JDT LS workspace");
+            assert_eq!(fs::read(&previous).unwrap(), b"previous bundled agent", "other windows may still use it");
+        }
+    }
+}
+
+#[test]
+fn bundled_lombok_is_available_offline_and_repairs_missing_or_corrupt_files() {
+    let env = Env::new();
+    let data = env.root.parent().unwrap();
+    let agent = managed_bundle(data, "lombok").unwrap();
+    let checksum = include_str!("../../../java/lombok/SHA256SUMS").split_whitespace().next().unwrap();
+    assert_eq!(sources::sha256_file(&agent).unwrap(), checksum);
+    for contents in [None, Some(b"incomplete jar".as_slice())] {
+        if let Some(contents) = contents {
+            fs::write(&agent, contents).unwrap();
+        } else {
+            fs::remove_file(&agent).unwrap();
+        }
+        assert_eq!(managed_bundle(data, "lombok"), Some(agent.clone()));
+        assert_eq!(sources::sha256_file(&agent).unwrap(), checksum);
+    }
+    assert_eq!(fs::read_dir(agent.parent().unwrap()).unwrap().count(), 1, "no temporary jars left behind");
+}
+
+#[test]
+fn concurrent_windows_get_the_same_complete_bundled_lombok() {
+    let env = Env::new();
+    let data = env.root.parent().unwrap();
+    std::thread::scope(|scope| {
+        let windows: Vec<_> = (0..8).map(|_| scope.spawn(|| managed_bundle(data, "lombok").unwrap())).collect();
+        let paths: Vec<_> = windows.into_iter().map(|window| window.join().unwrap()).collect();
+        assert!(paths.iter().all(|path| path == &paths[0]));
+        let checksum = include_str!("../../../java/lombok/SHA256SUMS").split_whitespace().next().unwrap();
+        assert_eq!(sources::sha256_file(&paths[0]).unwrap(), checksum);
+    });
 }
 
 #[test]
@@ -65,8 +130,8 @@ fn everything_missing_on_an_empty_system() {
     let ra = find(&list, "rust-analyzer");
     assert_eq!(ra.status, ToolStatus::Missing);
     assert_eq!(ra.languages, vec!["Rust".to_string()]);
-    assert!(!ra.can_install, "rustup is not on the fake PATH");
-    assert!(ra.unavailable_reason.as_deref().unwrap().contains("rustup"));
+    assert!(!ra.can_install, "curl is not on the fake PATH");
+    assert!(ra.unavailable_reason.as_deref().unwrap().contains("curl"));
     let vtsls = find(&list, "vtsls");
     assert!(vtsls.languages.iter().any(|l| l == "TypeScript"));
     assert!(vtsls.unavailable_reason.as_deref().unwrap().contains("npm"));
@@ -75,6 +140,11 @@ fn everything_missing_on_an_empty_system() {
     assert_eq!(ty.command, "ty");
     assert_eq!(ty.install_method.as_deref(), Some("pip (virtualenv)"));
     assert!(ty.languages.iter().any(|language| language == "Python"));
+    let pyrefly = find(&list, "pyrefly");
+    assert_eq!(pyrefly.status, ToolStatus::Missing);
+    assert_eq!(pyrefly.command, "pyrefly");
+    assert_eq!(pyrefly.install_method.as_deref(), Some("pip (virtualenv)"));
+    assert!(pyrefly.languages.iter().any(|language| language == "Python"));
     let angular = find(&list, "angular-language-server");
     assert_eq!(angular.command, "ngserver");
     assert_eq!(angular.install_method.as_deref(), Some("npm"));
@@ -95,14 +165,34 @@ fn everything_missing_on_an_empty_system() {
 fn interchangeable_servers_list_their_alternatives() {
     let env = Env::new();
     let list = env.tools().list(&langs());
-    let python = ["basedpyright", "pyright", "ty"];
+    let python = ["basedpyright", "pyright", "ty", "pyrefly"];
     for name in python {
         assert_eq!(find(&list, name).alternatives, python);
     }
     assert_eq!(find(&list, "vtsls").alternatives, ["vtsls", "typescript-language-server"]);
+    for name in ["jdtls", "kmp-lsp"] {
+        assert_eq!(find(&list, name).alternatives, ["jdtls", "kmp-lsp"]);
+        assert_eq!(find(&list, name).languages, ["Java"]);
+    }
     // A regular server after a fallback starts no group with it.
     assert!(find(&list, "angular-language-server").alternatives.is_empty());
+    assert!(find(&list, "ruff").alternatives.is_empty());
     assert!(find(&list, "rust-analyzer").alternatives.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn python_servers_name_uv_when_it_makes_the_virtualenv() {
+    let env = Env::new();
+    env.script(&env.sys, "uv", "exit 0");
+    let list = env.tools().list(&langs());
+    for name in ["basedpyright", "ty", "ruff"] {
+        let tool = find(&list, name);
+        assert_eq!(tool.install_method.as_deref(), Some("uv (virtualenv)"), "{name}");
+        assert!(tool.can_install, "{name}: uv alone is enough");
+    }
+    // debugpy's private copy is always made by `python -m pip`.
+    assert_eq!(find(&list, "debugpy").install_method.as_deref(), Some("pip (private copy)"));
 }
 
 #[cfg(unix)]
@@ -195,6 +285,80 @@ fn concurrent_installs_of_one_tool_are_rejected() {
     assert_eq!(InstallGuard::acquire("x-tool").err().unwrap().kind, ErrorKind::AlreadyExists);
     drop(a);
     assert!(InstallGuard::acquire("x-tool").is_ok());
+}
+
+/// A second caller mid-install joins the run (the other Settings window's
+/// duplicate install) and shares the result instead of `AlreadyExists`.
+#[test]
+fn second_install_joins_the_running_one() {
+    let slot = match install_slot("sqls", &CancellationToken::new()) {
+        Ok(slot) => slot,
+        Err(_) => panic!("no install is running"),
+    };
+    let owner = {
+        let slot = slot.clone();
+        std::thread::spawn(move || {
+            for i in 0..3 {
+                slot.broadcast(InstallEvent::Line { text: format!("line {i}") });
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            release_install_slot("sqls", &slot);
+            slot.finish(Err(IdeError::new(ErrorKind::Io, "compile failed")));
+        })
+    };
+    let events = Mutex::new(Vec::new());
+    let err = join_install(&slot, &CancellationToken::new(), &|e| events.lock().push(e)).unwrap_err();
+    owner.join().unwrap();
+    assert_eq!(err.kind, ErrorKind::Io);
+    assert_eq!(err.message, "compile failed");
+    let texts: Vec<String> = events
+        .into_inner()
+        .into_iter()
+        .filter_map(|e| match e {
+            InstallEvent::Line { text } => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert!(texts.contains(&"Joined the install already in progress…".to_string()), "{texts:?}");
+    assert!(texts.iter().any(|l| l == "line 2"), "{texts:?}");
+    // The slot is released: a fresh install can start.
+    match install_slot("sqls", &CancellationToken::new()) {
+        Ok(fresh) => release_install_slot("sqls", &fresh),
+        Err(_) => panic!("the finished install still holds its slot"),
+    }
+}
+
+/// A late caller gets the finished result without waiting.
+#[test]
+fn install_joined_after_it_finished_returns_the_result() {
+    let slot = match install_slot("marksman", &CancellationToken::new()) {
+        Ok(slot) => slot,
+        Err(_) => panic!("no install is running"),
+    };
+    let ok = ToolInfo {
+        name: "marksman".into(),
+        display_name: "Marksman".into(),
+        kind: ToolKind::LanguageServer,
+        command: "marksman".into(),
+        languages: vec![],
+        status: ToolStatus::Installed,
+        path: None,
+        version: Some("1.0".into()),
+        install_method: None,
+        can_install: true,
+        unavailable_reason: None,
+        can_uninstall: true,
+        install_hint: None,
+        homepage: None,
+        custom_error: None,
+        default_args: vec![],
+        default_initialization_options: None,
+        alternatives: vec![],
+    };
+    release_install_slot("marksman", &slot);
+    slot.finish(Ok(ok));
+    let info = join_install(&slot, &CancellationToken::new(), &|_| {}).unwrap();
+    assert_eq!(info.version.as_deref(), Some("1.0"));
 }
 
 /// Full release install through a fake `curl` that serves a local release JSON and archive.
@@ -436,6 +600,51 @@ printf '#!/bin/sh\necho "$GEM_HOME"\n' > "$bin/solargraph"; /bin/chmod +x "$bin/
 
 #[cfg(unix)]
 #[test]
+fn ruby_lsp_installs_into_the_project_ruby_not_a_private_gem_home() {
+    let env = Env::new();
+    let project = env._tmp.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    let marker = env._tmp.path().join("installed");
+    // Homebrew's Ruby: the gem bindir is not on the search path; only the Ruby knows it.
+    let bindir = env._tmp.path().join("gems/bin");
+    fs::create_dir_all(&bindir).unwrap();
+    env.script(&env.sys, "ruby", &format!("echo '{}'", bindir.display()));
+    // `gem list --exact ruby-lsp` knows the gem once `gem install ruby-lsp` ran, in the cwd it was given.
+    env.script(
+        &env.sys,
+        "gem",
+        &format!(
+            r#"case "$1" in
+install) echo "$PWD $@" > '{m}'; printf '#!/bin/sh\n' > '{b}/ruby-lsp'; /bin/chmod +x '{b}/ruby-lsp' ;;
+list) [ -f '{m}' ] && echo "ruby-lsp (0.26.11)" ;;
+uninstall) /bin/rm -f '{m}' ;;
+esac"#,
+            m = marker.display(),
+            b = bindir.display()
+        ),
+    );
+    let tools = env.tools().with_work_dir(Some(project.clone()));
+    assert_eq!(find(&tools.list(&langs()), "ruby-lsp").status, ToolStatus::Missing);
+    let info = tools.install("ruby-lsp", &langs(), &CancellationToken::new(), &|_| {}).unwrap();
+    assert_eq!(info.status, ToolStatus::OnPath);
+    assert_eq!(info.version.as_deref(), Some("0.26.11"));
+    // Found in the Ruby's own bindir, not reported as the `gem` command.
+    assert_eq!(info.path.as_deref(), Some(bindir.join("ruby-lsp").as_path()));
+    // Run in the project (so a version manager picks its Ruby), into the Ruby's own gem home.
+    let log = fs::read_to_string(&marker).unwrap();
+    assert!(log.starts_with(&*project.canonicalize().unwrap().to_string_lossy()), "{log}");
+    assert!(log.contains("install --no-document ruby-lsp") && !log.contains("--install-dir"), "{log}");
+    // No private gem home, no wrapper directory on the search path.
+    assert!(!env.root.join("ruby-lsp").exists());
+    // Uninstalling removes the gem, and an older managed copy.
+    fs::create_dir_all(env.root.join("ruby-lsp/gems")).unwrap();
+    let info = tools.uninstall("ruby-lsp", &langs()).unwrap();
+    assert_eq!(info.status, ToolStatus::Missing);
+    assert!(!env.root.join("ruby-lsp").exists());
+}
+
+#[cfg(unix)]
+#[test]
 fn dotnet_tool_install_into_tool_path() {
     let env = Env::new();
     env.script(
@@ -455,4 +664,139 @@ exit 0"#,
     assert_eq!(info.path.as_deref(), Some(wrapper.as_path()));
     let out = std::process::Command::new(&wrapper).output().unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "/opt/dotnet");
+}
+
+#[test]
+fn kotlin_debugger_uses_existing_release_recipe_and_language_definition() {
+    let spec = registry::find("kotlin-debug-adapter").unwrap();
+    assert!(matches!(
+        spec.method,
+        Method::Release { source: ReleaseSource::GitHub { repo: "fwcd/kotlin-debug-adapter" }, .. }
+    ));
+    assert!(langs().iter().any(|l| l.debugger.as_ref().is_some_and(|d| d.adapter == spec.name)));
+}
+
+#[test]
+fn the_installing_request_can_still_cancel_its_shared_install() {
+    let owner = CancellationToken::new();
+    let slot = match install_slot("taplo", &owner) {
+        Ok(slot) => slot,
+        Err(_) => panic!("slot already taken"),
+    };
+    owner.cancel();
+    assert!(slot.cancel.is_cancelled());
+    release_install_slot("taplo", &slot);
+}
+
+#[cfg(unix)]
+#[test]
+fn rust_analyzer_selects_openvsx_without_rustup() {
+    let env = Env::new();
+    env.script(&env.sys, "curl", "exit 0");
+    let tools = env.tools();
+    let spec = registry::find("rust-analyzer").unwrap();
+    assert!(matches!(
+        tools.install_method(spec),
+        Method::Release { source: ReleaseSource::OpenVsx { namespace: "rust-lang", extension: "rust-analyzer" }, .. }
+    ));
+    let info = tools.info("rust-analyzer", &langs()).unwrap();
+    assert_eq!(info.status, ToolStatus::Missing);
+    assert_eq!(info.install_method.as_deref(), Some("Open VSX"));
+    assert!(info.can_install);
+    assert!(info.unavailable_reason.is_none());
+    assert!(bin_dirs_in(&env.root, Platform::current()).contains(&env.root.join("rust-analyzer/bin")));
+}
+
+#[cfg(unix)]
+static RUST_ANALYZER_INSTALL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+#[cfg(unix)]
+#[test]
+fn rust_analyzer_prefers_rustup_and_installs_component() {
+    let _guard = RUST_ANALYZER_INSTALL.lock();
+    let env = Env::new();
+    env.script(&env.sys, "rustup", "test \"$*\" = 'component add rust-analyzer'");
+    env.script(&env.sys, "rust-analyzer", "echo 'rust-analyzer 1.0.0'");
+    let tools = env.tools();
+    assert!(matches!(
+        tools.install_method(registry::find("rust-analyzer").unwrap()),
+        Method::Rustup { component: "rust-analyzer" }
+    ));
+    let info = tools.info("rust-analyzer", &langs()).unwrap();
+    assert_eq!(info.install_method.as_deref(), Some("rustup"));
+    assert!(info.can_install, "rustup does not require curl");
+    let mut lines = Vec::new();
+    let emit = parking_lot::Mutex::new(&mut lines);
+    tools
+        .install("rust-analyzer", &langs(), &CancellationToken::new(), &|event| {
+            if let InstallEvent::Line { text } = event {
+                emit.lock().push(text);
+            }
+        })
+        .unwrap();
+    assert!(lines.iter().any(|line| line.contains("via rustup")));
+}
+
+#[cfg(unix)]
+#[test]
+fn rust_analyzer_managed_copy_survives_rustup_becoming_available() {
+    let _guard = RUST_ANALYZER_INSTALL.lock();
+    let env = Env::new();
+    let bin = env.root.join("rust-analyzer/bin");
+    env.script(&bin, "rust-analyzer", "echo 'rust-analyzer 1.0.0'");
+    for with_rustup in [false, true] {
+        if with_rustup {
+            env.script(&env.sys, "rustup", "exit 1");
+            env.script(&env.sys, "rust-analyzer", "exit 1");
+        }
+        let info = env.tools().info("rust-analyzer", &langs()).unwrap();
+        assert_eq!(info.status, ToolStatus::Installed);
+        assert_eq!(info.path.as_deref(), Some(bin.join("rust-analyzer").as_path()));
+        assert_eq!(info.install_method.as_deref(), Some("Open VSX"), "Reinstall refreshes the copy in use");
+        assert!(info.can_uninstall);
+    }
+    env.tools().uninstall("rust-analyzer", &langs()).unwrap();
+    assert!(!env.root.join("rust-analyzer").exists());
+}
+
+/// Windows has `python.exe` and `py`, not `python3.exe`; the `WindowsApps` aliases only count
+/// when the Store's Python behind them runs.
+#[test]
+fn windows_python_skips_store_aliases_that_do_not_run() {
+    let env = Env::new();
+    let aliases = env.sys.parent().unwrap().join("Microsoft").join("WindowsApps");
+    env.script(&aliases, "python", "exit 9009");
+    env.script(&aliases, "python3", "exit 9009");
+    env.script(&env.sys, "py", "echo Python 3.12.0");
+    let windows = Platform { os: Os::Windows, arch: platform::Arch::X64 };
+    let found = || {
+        let dirs = std::env::join_paths([aliases.clone(), env.sys.clone()]).unwrap();
+        Tools::with_paths(env.root.clone(), dirs, windows).python().map(|python| {
+            let dir = python.parent().unwrap().file_name().unwrap().to_string_lossy().into_owned();
+            format!("{dir}/{}", python.file_stem().unwrap().to_string_lossy())
+        })
+    };
+    assert_eq!(found().as_deref(), Some("sysbin/py"));
+    fs::remove_file(env.sys.join(if cfg!(windows) { "py.cmd" } else { "py" })).unwrap();
+    assert_eq!(found(), None, "only broken aliases are available");
+    env.script(&env.sys, "python3", "echo Python 3.12.0");
+    assert_eq!(found().as_deref(), Some("sysbin/python3"), "python3 is the final fallback");
+    env.script(&env.sys, "python", "echo Python 3.12.0");
+    assert_eq!(found().as_deref(), Some("sysbin/python"), "a broken alias must not hide a later interpreter");
+    env.script(&aliases, "python", "echo Python 3.13.0");
+    assert_eq!(found().as_deref(), Some("WindowsApps/python"), "the Store's Python runs");
+}
+
+#[cfg(unix)]
+#[test]
+fn python_probes_run_in_an_empty_private_directory() {
+    let env = Env::new();
+    // A stand-in interpreter that reports where it was started.
+    env.script(&env.sys, "python3", "pwd; ls -A");
+    let tools = env.tools();
+    let python = tools.python().unwrap();
+    let out = tools.python_command(&python).output().unwrap();
+    let out = String::from_utf8(out.stdout).unwrap();
+    let dir = env.root.join(".python-cwd");
+    assert_eq!(out.trim(), dir.canonicalize().unwrap().to_string_lossy());
 }

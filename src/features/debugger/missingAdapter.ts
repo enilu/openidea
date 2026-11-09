@@ -6,10 +6,14 @@ import { IpcError } from "@/platform/ipc";
 
 /** Adapters the tools installer can provide (adapter id → tool name). */
 const INSTALLABLE: Record<string, { tool: string; title: string }> = {
+  "kotlin-debug-adapter": { tool: "kotlin-debug-adapter", title: "The Kotlin debugger is not installed" },
+  netcoredbg: { tool: "netcoredbg", title: "netcoredbg is not installed" },
   debugpy: { tool: "debugpy", title: "debugpy is not installed" },
   "js-debug": { tool: "js-debug", title: "The JavaScript debugger (vscode-js-debug) is not installed" },
   delve: { tool: "delve", title: "Delve is not installed" },
   codelldb: { tool: "codelldb", title: "CodeLLDB is not installed" },
+  "php-debug": { tool: "php-debug", title: "PHP Debug (Xdebug) is not installed" },
+  "bash-debug": { tool: "bash-debug", title: "Bash Debug is not installed" },
 };
 
 export interface MissingAdapter {

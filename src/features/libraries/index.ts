@@ -6,9 +6,12 @@
  * read-only, like IDEA's library sources. Archives (the JDK's `src.zip`, jars)
  * are browsed through the backend's `<archive>!/<entry>` paths.
  */
-import { commands, type LibraryGroup } from "@/bindings";
+import { Channel } from "@tauri-apps/api/core";
+import { commands, type LibraryGroup, type RequestId } from "@/bindings";
+import { mergeLibraryGroups } from "@/platform/libraries";
+import { registerActions } from "@/platform/actions";
 import { setLibraryRoots } from "@/editor/api";
-import { call, isTauri, onIdeEvent } from "@/platform/ipc";
+import { call, isCancelled, isTauri, nextRequestId, onIdeEvent } from "@/platform/ipc";
 import { useProject } from "@/platform/project";
 import { registerProjectViewRoot, type ProjectViewRootContribution } from "@/workbench/contributions";
 
@@ -25,6 +28,8 @@ const GROUP_ICONS: Record<string, string> = {
   goModules: "file-gomod",
   maven: "maven-project",
   gradle: "file-gradle",
+  ruby: "file-ruby",
+  gems: "file-ruby",
 };
 
 /** An archive's root (`/jdk/lib/src.zip!`): its entries live below `<archive>!/`. */
@@ -42,6 +47,8 @@ const MANIFESTS = new Set([
   "package-lock.json",
   "yarn.lock",
   "pnpm-lock.yaml",
+  "pnpm-workspace.yaml",
+  "bun.lock",
   "bun.lockb",
   "Cargo.toml",
   "Cargo.lock",
@@ -50,6 +57,15 @@ const MANIFESTS = new Set([
   "go.mod",
   "go.sum",
   "go.work",
+  "pyproject.toml",
+  "setup.py",
+  "requirements.txt",
+  ".python-version",
+  "Gemfile",
+  "Gemfile.lock",
+  ".ruby-version",
+  ".tool-versions",
+  "mise.toml",
 ]);
 
 /** Whether an `fsChanged` event touches a library manifest. */
@@ -89,13 +105,18 @@ const sdkKey = (s: ReturnType<typeof useProject.getState>) => {
   const l = s.settings?.languages;
   return JSON.stringify([
     s.project?.root ?? null,
+    s.project?.trusted,
     l?.python?.interpreter,
+    l?.ruby?.interpreter,
     l?.java?.jdk,
     l?.node?.interpreter,
     l?.rust?.toolchain,
     l?.rust?.stdlib,
     l?.go?.goroot,
     l?.go?.gopath,
+    l?.go?.modules,
+    s.settings?.projectStructure?.libraries,
+    s.settings?.projectStructure?.sourceRoots,
   ]);
 };
 
@@ -106,6 +127,7 @@ export function activate(): () => void {
   let disposeReadOnly = () => {};
   let seq = 0;
   let shown = "";
+  let request: RequestId | undefined;
   const clear = () => {
     disposeRoot();
     disposeReadOnly();
@@ -114,25 +136,47 @@ export function activate(): () => void {
   };
   const refresh = () => {
     const id = ++seq;
-    if (!useProject.getState().project || !isTauri()) return clear();
-    call(commands.sdkProjectLibraries())
+    if (request !== undefined) void commands.cancelRequest(request).catch(() => {});
+    request = undefined;
+    if (!useProject.getState().project || useProject.getState().project?.trusted === false || !isTauri())
+      return clear();
+    let collected: LibraryGroup[] = [];
+    const show = (groups: LibraryGroup[]) => {
+      if (id !== seq) return;
+      const key = JSON.stringify(groups);
+      if (key === shown) return;
+      clear();
+      shown = key;
+      const root = librariesRoot(groups);
+      if (!root) return;
+      disposeReadOnly = setLibraryRoots(
+        "externalLibraries",
+        groups.flatMap((g) => g.roots.map((r) => r.path)),
+      );
+      disposeRoot = registerProjectViewRoot(root);
+    };
+    const channel = new Channel<LibraryGroup[]>();
+    channel.onmessage = (groups) => {
+      collected = mergeLibraryGroups([...collected, ...groups]);
+      show(collected);
+    };
+    const current = (request = nextRequestId());
+    call(commands.sdkProjectLibraries(current, channel))
       .then((groups) => {
-        if (id !== seq) return;
-        const key = JSON.stringify(groups);
-        if (key === shown) return;
-        clear();
-        shown = key;
-        const root = librariesRoot(groups);
-        if (!root) return;
-        disposeReadOnly = setLibraryRoots(
-          "externalLibraries",
-          groups.flatMap((g) => g.roots.map((r) => r.path)),
-        );
-        disposeRoot = registerProjectViewRoot(root);
+        collected = groups;
+        show(groups);
       })
-      .catch((e: unknown) => console.warn("external libraries: cannot list SDK roots", e));
+      .catch((e: unknown) => {
+        if (!isCancelled(e)) console.warn("external libraries: cannot list SDK roots", e);
+      })
+      .finally(() => {
+        if (request === current) request = undefined;
+      });
   };
   refresh();
+  const disposeActions = registerActions([
+    { id: "libraries.reload", title: "Reload External Libraries", category: "Go", hidden: true, run: refresh },
+  ]);
   const unsub = useProject.subscribe((s, prev) => {
     if (sdkKey(s) !== sdkKey(prev)) refresh();
   });
@@ -144,9 +188,11 @@ export function activate(): () => void {
   });
   return () => {
     seq++;
+    if (request !== undefined) void commands.cancelRequest(request).catch(() => {});
     clearTimeout(timer);
     unsub();
     unsubFs();
+    disposeActions();
     clear();
   };
 }

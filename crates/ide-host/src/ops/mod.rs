@@ -7,18 +7,24 @@ pub mod analysis;
 pub mod build;
 pub mod bytes;
 pub mod coverage;
+pub mod db;
 pub mod debug;
+pub mod dependencies;
+pub mod deploy;
 pub mod doc;
+pub mod docker;
 pub mod env;
 pub mod fs;
 pub mod history;
 pub mod java;
+pub mod jvm_icons;
 pub mod lsp;
 pub mod nav;
 pub mod notebook;
 pub mod project;
 mod python;
 pub mod refactor;
+pub mod routes;
 pub mod run;
 pub mod sdk;
 pub mod search;
@@ -67,6 +73,7 @@ pub fn register_all(d: &mut crate::rpc::Dispatcher) {
     analysis::register(d);
     syntax::register(d);
     spell::register(d);
+    dependencies::register(d);
     history::register(d);
     coverage::register(d);
     build::register(d);
@@ -80,6 +87,9 @@ pub fn register_all(d: &mut crate::rpc::Dispatcher) {
     search::register(d);
     run::register(d);
     env::register(d);
+    deploy::register(d);
+    docker::register(d);
+    db::register(d);
 }
 
 impl Host {
@@ -88,3 +98,5 @@ impl Host {
         self.runtime.spawn_blocking(f).await.map_err(|e| IdeError::internal(e.to_string()))?
     }
 }
+
+pub(crate) mod lsp_target;

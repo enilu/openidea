@@ -6,6 +6,15 @@
   flex-direction: column;
 }
 
+.unityNotice {
+  flex: none;
+  padding: 8px 12px;
+  color: var(--fg-muted);
+  font-size: 12px;
+  line-height: 1.5;
+  border-bottom: 1px solid var(--border);
+}
+
 .content {
   flex: 1;
   min-width: 0;
@@ -32,10 +41,15 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.rootLabel {
+.rootName {
   flex: none;
   max-width: 60%;
+}
+.rootLabel {
   color: var(--fg-strong);
+  font-weight: 600;
+}
+.moduleLabel {
   font-weight: 600;
 }
 /* IDEA's "excluded" look: ignored / excluded entries are dimmed. */
@@ -46,7 +60,9 @@
   background: color-mix(in srgb, var(--vcs-ignored) 14%, transparent);
 }
 .error {
-  text-decoration: underline wavy var(--danger);
+  text-decoration-line: underline;
+  text-decoration-style: wavy;
+  text-decoration-color: var(--danger);
   text-decoration-skip-ink: none;
   text-underline-offset: 3px;
 }
@@ -122,4 +138,17 @@
 .empty {
   padding: 8px 12px;
   color: var(--fg-subtle);
+}
+
+.iconStack {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+  width: 16px;
+  height: 16px;
+}
+.runnable {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
 }

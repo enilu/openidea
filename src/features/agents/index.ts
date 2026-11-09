@@ -9,6 +9,7 @@ import { executeAction } from "@/platform/actions";
 import { lazyComponent } from "@/ui";
 import { isVirtualUri } from "@/platform/virtualDocs";
 import {
+  registerEditorDropHandler,
   registerEditorKind,
   registerMenuGroup,
   registerSettingsPage,
@@ -17,11 +18,12 @@ import {
   toolWindowService,
 } from "@/workbench/contributions";
 import { AgentsStatus } from "./AgentsStatus";
-import { HOME_KIND, REGISTRY_PAGE, SESSION_KIND, TOOL_WINDOW } from "./model";
+import { HOME_KIND, REGISTRY_PAGE, SESSION_KIND, TASK_DRAG, TOOL_WINDOW } from "./model";
 import { sendPaths, sendSelection } from "./references";
 import { focusedSession } from "./sessionFocus";
 import { connect, disconnect, openHome, useAgents } from "./store";
 import { taskActions } from "./taskActions";
+import { replyActions } from "./replyActions";
 
 /** Settings › Tools › Agents (also used by the Settings window). */
 export function activateSettingsPages(): () => void {
@@ -43,8 +45,24 @@ export function activate(): () => void {
   sync(useProject.getState().project?.root);
   const disposers = [
     activateSettingsPages(),
+    // The performance harness (`perf/`): long conversations to switch between and scroll.
+    import.meta.env.DEV || import.meta.env.MODE === "perf"
+      ? registerActions([
+          {
+            id: "agents.openSampleConversations",
+            title: "Open Sample Conversations",
+            category: "Agents",
+            hidden: true,
+            run: async ({ arg }) => {
+              const { tasks = 2, turns = 150 } = (arg ?? {}) as { tasks?: number; turns?: number };
+              const { openSampleConversations } = await import("./sampleConversation");
+              openSampleConversations(tasks, turns);
+            },
+          },
+        ])
+      : () => {},
     useProject.subscribe((s, prev) => {
-      if (s.project?.root !== prev.project?.root) sync(s.project?.root);
+      if (s.project?.root !== prev.project?.root || s.project?.trusted !== prev.project?.trusted) sync(s.project?.root);
     }),
     registerToolWindow({
       id: TOOL_WINDOW,
@@ -53,6 +71,7 @@ export function activate(): () => void {
       anchor: "right",
       order: 0.5,
       component: lazyComponent(() => import("./AgentsView").then((m) => m.AgentsView)),
+      headerContent: lazyComponent(() => import("./AgentsView").then((m) => m.AgentsLocationActions)),
       headerActions: lazyComponent(() => import("./AgentsView").then((m) => m.AgentsHeaderActions)),
       useBadge: () => {
         const n = useAgents(
@@ -71,6 +90,8 @@ export function activate(): () => void {
       icon: () => "toolwindow-agents",
       // Tabs of tasks deleted meanwhile are closed when the tasks load (`connect`).
       restorable: true,
+      // Rebuilding a long conversation on every switch back is slow.
+      keepAlive: true,
     }),
     registerEditorKind({
       kind: HOME_KIND,
@@ -78,6 +99,11 @@ export function activate(): () => void {
       title: () => "New Agent Task",
       icon: () => "toolwindow-agents",
       restorable: true,
+    }),
+    // An explicit editor drop sets the placement for subsequent sessions too.
+    registerEditorDropHandler({
+      accepts: (type) => type === TASK_DRAG,
+      drop: ({ payload }) => void executeAction("agents.openTaskInEditor", payload),
     }),
     registerStatusItem({ id: "agents.status", align: "right", priority: 3, title: "Agents", component: AgentsStatus }),
     registerMenuGroup({
@@ -91,6 +117,7 @@ export function activate(): () => void {
     }),
     registerActions([
       ...taskActions,
+      ...replyActions,
       {
         id: "agents.findInConversation",
         title: "Find in Conversation",

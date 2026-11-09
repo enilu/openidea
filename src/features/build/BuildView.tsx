@@ -4,7 +4,8 @@
  * shows its full text on the right instead; Enter / double-click / F4 opens
  * its source (as IDEA: selection shows, navigation jumps).
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { copySelectionOnKeyDown } from "@/ui/selectableText";
+import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from "react";
 import clsx from "clsx";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { basename, relativeDir, useProject } from "@/platform/project";
@@ -33,7 +34,10 @@ import {
   rootNode,
   type BuildNode,
   type BuildStatus,
+  type ConsoleLine,
 } from "./model";
+import { findOutputLinks, type OutputLink } from "@/features/run/links";
+import { openTarget, openUrl } from "@/features/run/navigate";
 import { navigateToMessage, rerunBuild, selectBuildNode, useBuildRun } from "./store";
 import styles from "./Build.module.css";
 import { tx } from "@/platform/i18n";
@@ -134,7 +138,7 @@ function BuildTree() {
         .join(", ");
       return (
         <span className={styles.row}>
-          <Icon name={fileIconName(basename(n.path))} size={16} className={styles.fileIcon} />
+          <Icon name={fileIconName(basename(n.path), n.path)} size={16} className={styles.fileIcon} />
           <span className={clsx(styles.strong, errors > 0 && styles.fileError, state.selected && styles.selected)}>
             {basename(n.path)}
           </span>
@@ -200,7 +204,45 @@ function BuildTree() {
 
 const LINE_HEIGHT = 20;
 
+/**
+ * One console line: file locations and URLs (compiler diagnostics, stack
+ * frames) are links, resolved against the directory of the step that printed
+ * the line (Maven reactor modules run in their own directory), then the
+ * project root and a name search as in the run console.
+ */
+function ConsoleLineText({ line, root }: { line: ConsoleLine; root: string }) {
+  const links = useMemo(() => (line.kind === "system" ? [] : findOutputLinks(line.text)), [line.text, line.kind]);
+  const activate = (e: MouseEvent, link: OutputLink) => {
+    e.preventDefault();
+    if (window.getSelection()?.toString()) return;
+    if (link.kind === "url") void openUrl(link.url);
+    else void openTarget(link.target, line.cwd ?? root);
+  };
+  if (!links.length) return <>{line.text}</>;
+  const out: ReactNode[] = [];
+  let pos = 0;
+  for (const link of links) {
+    if (link.start > pos) out.push(line.text.slice(pos, link.start));
+    out.push(
+      <a
+        key={link.start}
+        href={link.kind === "url" ? link.url : undefined}
+        className={styles.link}
+        onClick={(e) => activate(e, link)}
+        role="link"
+        tabIndex={-1}
+      >
+        {line.text.slice(link.start, link.end)}
+      </a>,
+    );
+    pos = link.end;
+  }
+  out.push(line.text.slice(pos));
+  return <>{out}</>;
+}
+
 function BuildConsole() {
+  const root = useProject((s) => s.project?.root ?? "/");
   const lines = useBuildRun((s) => s.lines);
   const ref = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
@@ -219,6 +261,7 @@ function BuildConsole() {
       className={styles.console}
       tabIndex={0}
       role="log"
+      onKeyDown={copySelectionOnKeyDown}
       aria-label={tx("Build output")}
       onScroll={(e) => {
         const el = e.currentTarget;
@@ -234,7 +277,7 @@ function BuildConsole() {
               className={clsx(styles.line, styles[line.kind])}
               style={{ transform: `translateY(${v.start}px)` }}
             >
-              {line.text || " "}
+              <ConsoleLineText line={line} root={root} />
             </div>
           );
         })}
@@ -253,7 +296,13 @@ function MessageDetail({ message }: { message: BuildMessage }) {
       }`
     : null;
   return (
-    <div className={styles.detail} tabIndex={0} role="document" aria-label={tx("Build message")}>
+    <div
+      className={styles.detail}
+      tabIndex={0}
+      onKeyDown={copySelectionOnKeyDown}
+      role="document"
+      aria-label={tx("Build message")}
+    >
       {location && (
         <button type="button" className={styles.detailLocation} onClick={() => navigateToMessage(message, true)}>
           {location}

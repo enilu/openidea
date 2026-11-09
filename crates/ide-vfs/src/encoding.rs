@@ -22,6 +22,86 @@ pub(crate) fn encoding_label(enc: &'static Encoding) -> String {
     enc.name().to_ascii_lowercase()
 }
 
+fn unicode_escape(text: &str) -> Option<u16> {
+    let digits = text.strip_prefix("\\u")?.as_bytes().get(..4)?;
+    digits.iter().try_fold(0u16, |n, b| Some(n * 16 + (*b as char).to_digit(16)? as u16))
+}
+
+fn unicode_character(text: &str) -> Option<(char, usize)> {
+    let unit = unicode_escape(text)?;
+    if (0xD800..=0xDBFF).contains(&unit) {
+        let low = unicode_escape(&text[6..]).filter(|low| (0xDC00..=0xDFFF).contains(low))?;
+        char::from_u32(0x10000 + ((unit as u32 - 0xD800) << 10) + low as u32 - 0xDC00).map(|c| (c, 12))
+    } else {
+        // A decoded line terminator would save as a real line break and split the property.
+        char::from_u32(unit as u32).filter(|c| !matches!(c, '\n' | '\r')).map(|c| (c, 6))
+    }
+}
+
+/// Decodes eligible Java properties Unicode escapes once. Backslash pairs,
+/// malformed escapes and unpaired surrogates retain their literal spelling.
+pub fn decode_properties_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        if rest.starts_with("\\\\") {
+            out.push_str("\\\\");
+            rest = &rest[2..];
+            continue;
+        }
+        if let Some((c, len)) = unicode_character(rest) {
+            out.push(c);
+            rest = &rest[len..];
+            continue;
+        }
+        let c = rest.chars().next().expect("nonempty");
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    out
+}
+
+/// Serializes displayed properties text as ASCII, using uppercase UTF-16 units.
+/// Existing ASCII Unicode escapes retain their spelling and meaning on disk.
+pub fn encode_properties_ascii(text: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        rest = &rest[c.len_utf8()..];
+        if c == '\\' {
+            if rest.starts_with('\\') {
+                out.push_str("\\\\");
+                rest = &rest[1..];
+            } else if rest.chars().next().is_some_and(|next| !next.is_ascii()) {
+                // Keep a literal backslash from swallowing a generated escape.
+                out.push_str("\\u005C");
+            } else {
+                out.push(c);
+            }
+        } else if c.is_ascii() && c != '\0' {
+            out.push(c);
+        } else {
+            for unit in c.encode_utf16(&mut [0; 2]) {
+                write!(out, "\\u{unit:04X}").expect("write to string");
+            }
+        }
+    }
+    out
+}
+
+/// Preserve an ASCII file's exact escape spelling when edits were undone or
+/// replaced with identical displayed text. Otherwise serialize the new buffer.
+pub fn save_properties_text(path: &Path, text: &str) -> IdeResult<f64> {
+    if let Ok(bytes) = fs::read(path)
+        && bytes.is_ascii()
+        && decode_properties_escapes(std::str::from_utf8(&bytes).expect("ASCII")) == text
+    {
+        return Ok(mtime_ms(&fs::metadata(path)?));
+    }
+    write_atomic(path, encode_properties_ascii(text).as_bytes())
+}
+
 /// Detects BOM-less UTF-16 from the distribution of NUL bytes in mostly-ASCII text.
 fn sniff_utf16(sample: &[u8]) -> Option<&'static Encoding> {
     if sample.len() < 4 {
@@ -147,6 +227,49 @@ pub(crate) fn load_text(path: &Path) -> IdeResult<LoadedText> {
     })
 }
 
+/// Bounded disk snapshots for background consumers that share editor decoding.
+pub(crate) fn load_text_bounded(path: &Path, fallback: Option<&str>, max_bytes: usize) -> IdeResult<LoadedText> {
+    use std::io::Read;
+    let regular = |meta: &fs::Metadata| meta.is_file() && meta.len() <= max_bytes as u64;
+    if !regular(&fs::metadata(path)?) {
+        return Err(IdeError::invalid("document is too large or is not a regular file"));
+    }
+    let file = fs::File::open(path)?;
+    let meta = file.metadata()?;
+    if !regular(&meta) {
+        return Err(IdeError::invalid("document is too large or is not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1) as u64).read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(IdeError::invalid("document is too large"));
+    }
+    let len = bytes.len() as u64;
+    let (mut text, mut enc, has_bom, binary) = decode(&bytes);
+    if !binary
+        && !has_bom
+        && enc != UTF_8
+        && enc != UTF_16LE
+        && enc != UTF_16BE
+        && let Some(fallback) = fallback.and_then(|label| Encoding::for_label(label.trim().as_bytes()))
+    {
+        text = fallback.decode_without_bom_handling(&bytes).0.into_owned();
+        enc = fallback;
+    }
+    if text.len() > max_bytes {
+        return Err(IdeError::invalid("decoded document is too large"));
+    }
+    Ok(LoadedText {
+        text,
+        encoding: encoding_label(enc),
+        has_bom,
+        binary,
+        large: len > LARGE_FILE_THRESHOLD,
+        too_large: len > READ_ONLY_THRESHOLD,
+        mtime_ms: mtime_ms(&meta),
+    })
+}
+
 /// Loads `path` decoded as `encoding` (a WHATWG label) instead of detecting it
 /// ("Reload with Encoding"). A matching BOM is stripped and reported.
 pub(crate) fn load_text_as(path: &Path, encoding: &str) -> IdeResult<LoadedText> {
@@ -221,22 +344,46 @@ pub(crate) fn is_atomic_temp(path: &Path) -> bool {
     path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with('.') && n.contains(TMP_MARKER))
 }
 
+/// `sync_all` failures that mean "this filesystem cannot fsync at all", not that
+/// the data was lost: ENOTTY (`os error 25`, virtio-fs on macOS VMs answering
+/// F_FULLFSYNC/fsync with "Inappropriate ioctl for device") and EINVAL (some
+/// network filesystems). Other errors keep failing the write.
+fn sync_error_is_tolerable(e: &std::io::Error) -> bool {
+    if e.kind() == std::io::ErrorKind::InvalidInput {
+        return true;
+    }
+    // EINVAL is already covered by InvalidInput; ENOTTY has no ErrorKind of its own.
+    #[cfg(unix)]
+    return e.raw_os_error() == Some(25);
+    #[cfg(not(unix))]
+    false
+}
+
 /// Writes `bytes` to `path` atomically: temp file in the same directory, fsync,
 /// rename over the target. Preserves the permissions of an existing file and
 /// writes through symlinks. Falls back to an in-place write when the directory
 /// does not allow creating files. Returns the new mtime in ms.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> IdeResult<f64> {
-    write_atomic_impl(path, bytes, true)
+    write_atomic_impl(path, bytes, true, false)
 }
 
 /// Replaces a file atomically without falling back to truncating it in place.
 /// Preserves existing permissions and writes through symlinks; if a sibling
 /// temporary file cannot be created, leaves the existing file untouched.
 pub fn write_atomic_strict(path: &Path, bytes: &[u8]) -> IdeResult<f64> {
-    write_atomic_impl(path, bytes, false)
+    write_atomic_impl(path, bytes, false, false)
 }
 
-fn write_atomic_impl(path: &Path, bytes: &[u8], allow_in_place: bool) -> IdeResult<f64> {
+/// Atomically creates/replaces a private file, owner-only from creation.
+/// The parent must be a private directory (including an inheritable owner ACL
+/// on Windows). Existing Unix permissions are restricted to the owner.
+pub fn write_atomic_private(path: &Path, bytes: &[u8]) -> IdeResult<f64> {
+    write_atomic_impl(path, bytes, false, true)
+}
+
+fn write_atomic_impl(path: &Path, bytes: &[u8], allow_in_place: bool, private: bool) -> IdeResult<f64> {
+    #[cfg(not(unix))]
+    let _ = private;
     let target = match fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_symlink() => fs::canonicalize(path)?,
         _ => path.to_path_buf(),
@@ -266,10 +413,32 @@ fn write_atomic_impl(path: &Path, bytes: &[u8], allow_in_place: bool) -> IdeResu
         Err(e) => return Err(e.into()),
     };
     let result = (|| -> std::io::Result<()> {
+        #[cfg(unix)]
+        if private {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
         file.write_all(bytes)?;
-        file.sync_all()?;
+        if let Err(e) = file.sync_all() {
+            // virtio-fs (macOS VMs) and similar filesystems have no fsync/F_FULLFSYNC
+            // (ENOTTY, EINVAL): the write itself already went through, so the rename is
+            // still the best durability the filesystem offers — degrade like SQLite
+            // instead of failing the whole atomic write.
+            if sync_error_is_tolerable(&e) {
+                tracing::debug!("fsync unsupported for {}: {e}; continuing", target.display());
+            } else {
+                return Err(e);
+            }
+        }
         if let Some(meta) = &existing {
-            fs::set_permissions(&tmp, meta.permissions())?;
+            #[allow(unused_mut)]
+            let mut permissions = meta.permissions();
+            #[cfg(unix)]
+            if private {
+                use std::os::unix::fs::PermissionsExt;
+                permissions.set_mode(0o600);
+            }
+            fs::set_permissions(&tmp, permissions)?;
         }
         drop(file);
         fs::rename(&tmp, &target)
@@ -284,6 +453,61 @@ fn write_atomic_impl(path: &Path, bytes: &[u8], allow_in_place: bool) -> IdeResu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn properties_unicode_escapes() {
+        for (source, displayed) in [
+            (r"test.key1=Hello", "test.key1=Hello"),
+            (r"test.key2=\u4F60\u597D", "test.key2=你好"),
+            (r"test.key3=\u4f60\u597d", "test.key3=你好"),
+            (r"\u0041\uD83D\uDE00!", "A😀!"),
+            (r"\\u0041", r"\\u0041"),
+            (r"\\\u0041", r"\\A"),
+            (r"\\\\u0041", r"\\\\u0041"),
+            (r"\u005Cu0041", r"\u0041"),
+            (r"\u123 \u12xz \uu0041 \uD800 \uDC00", r"\u123 \u12xz \uu0041 \uD800 \uDC00"),
+            (r"\uD800\u0041", r"\uD800A"),
+            (r"\uD800\uD83D\uDE00", "\\uD800😀"),
+        ] {
+            assert_eq!(decode_properties_escapes(source), displayed, "{source}");
+        }
+        assert_eq!(encode_properties_ascii("你好😀"), r"\u4F60\u597D\uD83D\uDE00");
+        for text in ["plain=ASCII\r\n", r"escaped=\\u0041", r"bad=\u12xz", r"bad=\uD800"] {
+            assert_eq!(encode_properties_ascii(text), text);
+        }
+        for text in ["你好😀", "\0", "\\中", "\\\\中", "\\\\\\😀", r"\\u0041"] {
+            let ascii = encode_properties_ascii(text);
+            assert!(ascii.is_ascii());
+            assert_eq!(decode_properties_escapes(&ascii), text, "{ascii}");
+        }
+    }
+
+    #[test]
+    fn properties_ascii_escapes_are_not_escaped_again() {
+        for text in [
+            r"test.key2=\u4F60\u597D",
+            r"test.key3=\u4f60\u597d",
+            r"ascii=\u0041\u005C\u000A",
+            r"emoji=\uD83D\uDE00",
+            r"slashes=\\u4F60 \\\u4F60 \\\\u4F60",
+            r"bad=\u123 \u12xz \uu0041 \uD800 \uDC00",
+        ] {
+            assert_eq!(encode_properties_ascii(text), text, "{text}");
+        }
+        let mixed = "raw=\\u4f60\\u597d; native=你好😀";
+        let expected = r"raw=\u4f60\u597d; native=\u4F60\u597D\uD83D\uDE00";
+        assert_eq!(encode_properties_ascii(mixed), expected);
+        assert_eq!(encode_properties_ascii(expected), expected);
+        assert_eq!(decode_properties_escapes(expected), "raw=你好; native=你好😀");
+    }
+
+    #[test]
+    fn properties_line_terminator_escapes_survive_an_edit() {
+        let source = r"key=one\u000Atwo\u000Dthree";
+        let displayed = decode_properties_escapes(source);
+        assert_eq!(displayed, source);
+        assert_eq!(encode_properties_ascii(&displayed.replace("three", "3")), r"key=one\u000Atwo\u000D3");
+    }
 
     #[test]
     fn strict_write_replaces_complete_contents() {
@@ -382,6 +606,41 @@ mod tests {
     }
 
     #[test]
+    fn bounded_snapshots_match_editor_decoding_and_enforce_both_limits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("text");
+        for (encoding, bom) in [
+            ("utf-8", true),
+            ("utf-16le", true),
+            ("utf-16be", true),
+            ("utf-16le", false),
+            ("utf-16be", false),
+            ("gbk", false),
+        ] {
+            let text = if encoding == "gbk" {
+                "中文测试，这是一段中文文本。"
+            } else {
+                "hello world 😀\nline two\n"
+            };
+            let text = format!("{text}{}", "padding ".repeat(16));
+            crate::save_text(&path, &text, encoding, bom).unwrap();
+            let ordinary = crate::load_text_with_fallback(&path, Some(encoding)).unwrap();
+            let bounded = load_text_bounded(&path, Some(encoding), 1024).unwrap();
+            assert!(!bounded.binary, "{encoding} BOM={bom}");
+            assert_eq!(bounded.text, text, "{encoding} BOM={bom}");
+            assert_eq!(
+                (&bounded.text, &bounded.encoding, bounded.has_bom),
+                (&ordinary.text, &ordinary.encoding, ordinary.has_bom)
+            );
+            assert!(load_text_bounded(&path, Some(encoding), 2).is_err());
+        }
+        fs::write(&path, [0xe9; 4]).unwrap();
+        assert!(load_text_bounded(&path, Some("windows-1252"), 4).is_err(), "decoded UTF-8 expansion is bounded");
+        fs::write(&path, b"\x7fELF\0\0").unwrap();
+        assert!(load_text_bounded(&path, None, 1024).unwrap().binary);
+    }
+
+    #[test]
     fn encode_variants() {
         assert_eq!(encode("hi", "utf-8", true).unwrap(), b"\xEF\xBB\xBFhi");
         assert_eq!(encode("hi", "UTF-8", false).unwrap(), b"hi");
@@ -390,5 +649,20 @@ mod tests {
         assert_eq!(encode("中", "gbk", true).unwrap(), [0xD6, 0xD0]);
         assert_eq!(encode("x", "nope", false).unwrap_err().kind, ide_core::error::ErrorKind::InvalidInput);
         assert_eq!(encode("中", "windows-1252", false).unwrap_err().kind, ide_core::error::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn sync_errors_without_fsync_support_are_tolerable() {
+        // Some network filesystems report EINVAL for fsync.
+        assert!(sync_error_is_tolerable(&std::io::Error::new(std::io::ErrorKind::InvalidInput, "EINVAL")));
+        #[cfg(unix)]
+        {
+            // virtio-fs on macOS VMs answers fsync with "Inappropriate ioctl for device".
+            assert!(sync_error_is_tolerable(&std::io::Error::from_raw_os_error(25)));
+            assert!(sync_error_is_tolerable(&std::io::Error::from_raw_os_error(22)));
+        }
+        // Real write failures still fail the atomic write.
+        assert!(!sync_error_is_tolerable(&std::io::Error::from_raw_os_error(28)));
+        assert!(!sync_error_is_tolerable(&std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied")));
     }
 }

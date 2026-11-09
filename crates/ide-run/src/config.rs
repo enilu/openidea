@@ -30,6 +30,7 @@
 //! Configurations not stored as project files live in the same format in the
 //! workspace-local, git-ignored `run.local.toml`.
 
+use crate::BuildPolicy;
 use crate::{BeforeLaunchTask, RunConfig, RunExtras};
 use ide_core::{IdeError, IdeResult, project_dir};
 use serde::Deserialize;
@@ -78,6 +79,7 @@ struct FileConfig {
     #[serde(default)]
     args: Vec<String>,
     cwd: Option<PathBuf>,
+    module: Option<String>,
     #[serde(default)]
     env: BTreeMap<String, String>,
     #[serde(default, alias = "isTest", alias = "is_test")]
@@ -99,6 +101,8 @@ struct FileConfig {
     output_file: Option<String>,
     #[serde(default, alias = "beforeLaunch")]
     before_launch: Vec<BeforeLaunchTask>,
+    #[serde(alias = "buildPolicy")]
+    build_policy: Option<BuildPolicy>,
     #[serde(default)]
     compound: Vec<String>,
     #[serde(default, alias = "showOnStdout")]
@@ -116,7 +120,7 @@ struct FileConfig {
     target: Option<String>,
 }
 
-fn slug(s: &str) -> String {
+pub(crate) fn slug(s: &str) -> String {
     let mut out = String::new();
     for c in s.chars() {
         if c.is_alphanumeric() {
@@ -161,6 +165,7 @@ fn convert(configs: Vec<FileConfig>, local: bool) -> Vec<RunConfig> {
             debug_adapter: c.debug_adapter.filter(|d| !d.is_empty()),
             allow_parallel: c.allow_parallel,
             extras: RunExtras {
+                module: c.module,
                 params: c.params,
                 folder: non_empty(c.folder),
                 local,
@@ -169,6 +174,7 @@ fn convert(configs: Vec<FileConfig>, local: bool) -> Vec<RunConfig> {
                 stdin_file: non_empty(c.stdin_file),
                 output_file: non_empty(c.output_file),
                 before_launch: c.before_launch.into_iter().filter(|t| !t.kind.is_empty()).collect(),
+                build_policy: c.build_policy,
                 compound: c.compound,
                 show_on_stdout: c.show_on_stdout,
                 show_on_stderr: c.show_on_stderr,
@@ -209,6 +215,9 @@ fn to_table(c: &RunConfig) -> Table {
     t.insert("command", value(&c.command));
     if !c.args.is_empty() {
         t.insert("args", value(c.args.iter().collect::<Array>()));
+    }
+    if let Some(module) = &c.extras.module {
+        t.insert("module", value(module));
     }
     if let Some(cwd) = &c.cwd {
         t.insert("cwd", value(cwd.to_string_lossy().replace('\\', "/")));
@@ -263,6 +272,9 @@ fn to_table(c: &RunConfig) -> Table {
             tasks.push(it);
         }
         t.insert("before-launch", value(tasks));
+    }
+    if let Some(policy) = x.build_policy {
+        t.insert("build-policy", value(policy.key()));
     }
     if !x.compound.is_empty() {
         t.insert("compound", value(x.compound.iter().collect::<Array>()));
@@ -335,7 +347,11 @@ fn write_array(path: &Path, key: &str, configs: &[&RunConfig], suppressed: Optio
 
 /// Keeps the workspace-local file out of version control (`.openidea/.gitignore`).
 fn ignore_local(root: &Path) -> IdeResult<()> {
-    let entry = format!("/{LOCAL_FILE}");
+    ignore_private(root, &format!("/{LOCAL_FILE}"))
+}
+
+/// Adds `entry` to `.openidea/.gitignore` unless it is already listed.
+pub(crate) fn ignore_private(root: &Path, entry: &str) -> IdeResult<()> {
     let file = project_dir::path(root, ".gitignore");
     let current = fs::read_to_string(&file).unwrap_or_default();
     if current.lines().any(|l| l.trim() == entry) {
@@ -347,7 +363,7 @@ fn ignore_local(root: &Path) -> IdeResult<()> {
     } else if !text.ends_with('\n') {
         text.push('\n');
     }
-    text.push_str(&entry);
+    text.push_str(entry);
     text.push('\n');
     if let Some(dir) = file.parent() {
         fs::create_dir_all(dir)?;

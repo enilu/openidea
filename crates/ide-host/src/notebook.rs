@@ -1,7 +1,7 @@
 //! Project-incarnation notebook ownership and whole-batch execution admission.
 use crate::ops::Channel;
 use ide_core::error::ErrorKind;
-use ide_core::{CancellationToken, IdeError, IdeEvent, IdeResult, SharedSink};
+use ide_core::{CancellationToken, IdeError, IdeEvent, IdeResult, IpcPath, SharedSink};
 use ide_notebook::kernel::{KernelManager, KernelOutput};
 use ide_notebook::{NotebookDocument, NotebookEdit, NotebookSnapshot};
 use parking_lot::Mutex;
@@ -17,7 +17,7 @@ use tokio::sync::{Mutex as AsyncMutex, watch};
 #[serde(rename_all = "camelCase")]
 pub struct NotebookOutputEvent {
     pub id: String,
-    pub path: String,
+    pub path: IpcPath,
     pub cell: String,
     pub msg_id: String,
     pub kind: String,
@@ -407,6 +407,24 @@ impl NotebookService {
         }
     }
 
+    pub async fn restrict(&self) {
+        let documents: Vec<_> = self.registry.lock().documents.values().cloned().collect();
+        for document in &documents {
+            let mut state = document.state.lock();
+            state.generation += 1;
+            if let Some(batch) = &state.active {
+                batch.cancel.cancel();
+            }
+        }
+        for document in documents {
+            let _ = self.kernels.shutdown_kernel(&document.path).await;
+            let batch = document.state.lock().active.clone();
+            if let Err(error) = self.drain(&document, batch).await {
+                tracing::warn!("notebook restriction: {error}");
+            }
+        }
+    }
+
     pub async fn shutdown(&self) {
         self.stop_admission();
         self.kernels.shutdown().await;
@@ -518,7 +536,7 @@ fn commit_output(
     };
     Ok(Some(NotebookOutputEvent {
         id: document.id.clone(),
-        path: document.path.to_string_lossy().into_owned(),
+        path: document.path.clone().into(),
         cell: cell.to_owned(),
         msg_id: output.msg_id,
         kind: output.kind,
@@ -572,6 +590,16 @@ mod tests {
         assert_eq!(service.get(&reopened.id).unwrap().id, reopened.id);
         service.shutdown().await;
         other.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_notebook_path_reaches_the_ui_as_the_project_tree_names_it() {
+        let (dir, service, _) = fixture();
+        let ui_path =
+            format!("{}/session.ipynb", ide_core::ipc_path::to_ipc(&dunce::canonicalize(dir.path()).unwrap()));
+        let snapshot = service.open(Path::new(&ui_path)).unwrap();
+        assert_eq!(serde_json::to_value(&snapshot).unwrap()["path"], ui_path);
+        service.shutdown().await;
     }
 
     #[tokio::test(start_paused = true)]

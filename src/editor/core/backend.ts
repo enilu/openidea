@@ -21,10 +21,15 @@ import {
   type SyntaxHighlights,
   type TextChange,
 } from "@/platform/ipc";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+
+import { EditorState } from "@codemirror/state";
+import { customRegions } from "./cm/regions";
 
 export type LanguageInfo = LanguageInfo_Serialize;
 
 export interface DocPatchedEvent {
+  workspaceEdit?: boolean;
   doc: DocId;
   baseVersion: number;
   version: number;
@@ -33,11 +38,13 @@ export interface DocPatchedEvent {
 
 export interface DocBackend {
   open(path: string): Promise<DocumentInfo>;
-  /** Opens the read-only virtual document behind a non-`file:` URI (library class contents). */
+  /** Opens a read-only language-server document (library or disk class contents). */
   openVirtual(uri: string): Promise<DocumentInfo>;
   close(doc: DocId): Promise<void>;
   edit(doc: DocId, baseVersion: number, changes: TextChange[]): Promise<number>;
   save(doc: DocId): Promise<void>;
+  /** Re-check every open file for external changes missed by file watchers. */
+  syncFromDisk?(): Promise<void>;
   snapshot(doc: DocId): Promise<DocumentInfo>;
   setLineEnding(doc: DocId, lineEnding: LineEnding): Promise<void>;
   /** "Reload with Encoding" (`reload`) or "Convert to Encoding"; resolves to the new encoding. */
@@ -55,6 +62,11 @@ export interface DocBackend {
   /** Files changed on disk (used to refresh nothing but closed-file state). */
   onFsChanged?(handler: (e: { removed: string[] }) => void): () => void;
   /**
+   * Every OpenIDEA window lost focus to another application. Also seen while focus is in a frame
+   * (a plugin's web view), which hides the window's own `blur`.
+   */
+  onApplicationDeactivated?(handler: () => void): () => void;
+  /**
    * An open document's language changed (Settings › File Types, Override File
    * Type), or its own mode (`DocumentInfo.uiMode`).
    */
@@ -67,6 +79,7 @@ export const ipcBackend: DocBackend = {
   close: async (doc) => void (await call(commands.docClose(doc))),
   edit: (doc, baseVersion, changes) => call(commands.docEdit(doc, baseVersion, { changes })),
   save: async (doc) => void (await call(commands.docSave(doc))),
+  syncFromDisk: async () => void (await call(commands.docSyncFromDisk())),
   snapshot: (doc) => call(commands.docSnapshot(doc)),
   setLineEnding: async (doc, le) => void (await call(commands.docSetLineEnding(doc, le))),
   setEncoding: (doc, encoding, reload) => call(commands.docSetEncoding(doc, encoding, reload)),
@@ -79,6 +92,11 @@ export const ipcBackend: DocBackend = {
   onPatched: (h) => onIdeEvent("docPatched", (e) => h(e)),
   onDirty: (h) => onIdeEvent("docDirty", (e) => h(e)),
   onFsChanged: (h) => onIdeEvent("fsChanged", (e) => h(e)),
+  onApplicationDeactivated: (h) => {
+    if (!isTauri()) return () => {};
+    const listener = getCurrentWebviewWindow().listen("ide://application-deactivated", () => h());
+    return () => void listener.then((unlisten) => unlisten());
+  },
   onLanguage: (h) => onIdeEvent("docLanguage", (e) => h(e)),
 };
 
@@ -100,7 +118,11 @@ interface MemDoc {
 }
 
 const EXT_LANG: Record<string, string> = {
+  http: "http",
+  rest: "http",
   ts: "typescript",
+  mts: "typescript",
+  cts: "typescript",
   tsx: "typescriptreact",
   js: "javascript",
   jsx: "javascriptreact",
@@ -108,11 +130,14 @@ const EXT_LANG: Record<string, string> = {
   kt: "kotlin",
   kts: "kotlin",
   java: "java",
+  cs: "csharp",
   py: "python",
   gd: "gdscript",
   go: "go",
   json: "json",
   md: "markdown",
+  adoc: "asciidoc",
+  asciidoc: "asciidoc",
   css: "css",
   html: "html",
   yml: "yaml",
@@ -126,13 +151,15 @@ const EXT_LANG: Record<string, string> = {
   cmd: "bat",
   sql: "sql",
   xml: "xml",
+  svg: "xml",
+  vue: "vue",
 };
 
 const MEM_LANGUAGES: LanguageInfo[] = [
   {
     id: "typescript",
     name: "TypeScript",
-    extensions: ["ts"],
+    extensions: ["ts", "mts", "cts"],
     uiMode: "TypeScript",
     lineComment: "//",
     blockComment: ["/*", "*/"],
@@ -211,6 +238,15 @@ const MEM_LANGUAGES: LanguageInfo[] = [
     indent: { tabSize: 2, insertSpaces: true },
   },
   {
+    id: "asciidoc",
+    name: "AsciiDoc",
+    extensions: ["adoc", "asciidoc"],
+    uiMode: "AsciiDoc",
+    lineComment: "//",
+    blockComment: null,
+    indent: { tabSize: 2, insertSpaces: true },
+  },
+  {
     id: "markdown",
     name: "Markdown",
     extensions: ["md"],
@@ -237,6 +273,15 @@ const MEM_LANGUAGES: LanguageInfo[] = [
     blockComment: null,
     indent: { tabSize: 4, insertSpaces: true },
   },
+  ...["xml", "html", "vue", "css"].map((id): LanguageInfo => ({
+    id,
+    name: id.toUpperCase(),
+    extensions: id === "xml" ? ["xml", "svg"] : [id],
+    uiMode: id === "xml" ? "XML" : id === "css" ? "CSS" : id === "vue" ? "Vue" : "HTML",
+    lineComment: null,
+    blockComment: id === "css" ? ["/*", "*/"] : ["<!--", "-->"],
+    indent: { tabSize: 2, insertSpaces: true },
+  })),
   {
     id: "plaintext",
     name: "Plain Text",
@@ -307,7 +352,7 @@ function lineIndex(text: string) {
 
 export interface MemoryBackend extends DocBackend {
   /** Test/dev hook: apply a backend-originated change and emit `docPatched`. */
-  patch(doc: DocId, changes: TextChange[]): void;
+  patch(doc: DocId, changes: TextChange[], workspaceEdit?: boolean): void;
   /** Seed file contents before opening. */
   files: Map<string, string>;
   docs: Map<DocId, MemDoc>;
@@ -336,12 +381,20 @@ export function createMemoryBackend(files: Record<string, string> = {}): MemoryB
     ...(d.uri ? { uri: d.uri } : {}),
     ...(d.uiMode ? { uiMode: d.uiMode } : {}),
   });
-  // An Angular project's templates (an `angular.json` above them), like the backend's `framework-ui-modes`.
-  const uiModeOf = (path: string) =>
-    path.endsWith(".html") &&
-    [...store.keys()].some((f) => f.endsWith("/angular.json") && path.startsWith(f.slice(0, -"angular.json".length)))
-      ? "Angular Template"
-      : null;
+  // Framework modes mirror the backend's `framework-ui-modes` definitions.
+  const uiModeOf = (path: string) => {
+    const angular = [...store.keys()].some((f) => {
+      const root = f.endsWith("/angular.json")
+        ? f.slice(0, -"angular.json".length)
+        : f.includes("/node_modules/@angular/core/")
+          ? f.slice(0, f.indexOf("/node_modules/@angular/core/") + 1)
+          : null;
+      return root !== null && path.startsWith(root);
+    });
+    if (!angular) return null;
+    if (path.endsWith(".html")) return "Angular Template";
+    return /\.(?:ts|mts|cts)$/.test(path) ? "Angular TypeScript" : null;
+  };
   const get = (doc: DocId) => {
     const d = docs.get(doc);
     if (!d) throw new IpcError({ kind: "notFound", message: `document ${doc} is not open` });
@@ -504,8 +557,24 @@ export function createMemoryBackend(files: Record<string, string> = {}): MemoryB
     },
     async folding(doc) {
       const d = get(doc);
-      const out: FoldRange[] = [];
-      const seen = new Set<number>();
+      const info = MEM_LANGUAGES.find((language) => language.id === d.language);
+      const state = EditorState.create({
+        doc: d.text,
+        extensions: EditorState.languageData.of(() => [
+          {
+            commentTokens: {
+              line: info?.lineComment ?? undefined,
+              block: info?.blockComment && { open: info.blockComment[0], close: info.blockComment[1] },
+            },
+          },
+        ]),
+      });
+      const out: FoldRange[] = customRegions(state).map((region) => ({
+        start_line: region.startLine - 1,
+        end_line: region.endLine - 1,
+        kind: "region",
+      }));
+      const seen = new Set(out.map((fold) => fold.start_line));
       const stack: number[] = [];
       d.text.split("\n").forEach((line, i) => {
         for (const ch of line) {
@@ -538,13 +607,13 @@ export function createMemoryBackend(files: Record<string, string> = {}): MemoryB
       dirtyHandlers.add(h);
       return () => dirtyHandlers.delete(h);
     },
-    patch(doc, changes) {
+    patch(doc, changes, workspaceEdit = false) {
       const d = get(doc);
       const before = d.text !== d.saved;
       const baseVersion = d.version;
       d.text = applyChanges(d.text, changes);
       d.version++;
-      const e = { doc, baseVersion, version: d.version, changes };
+      const e = { doc, baseVersion, version: d.version, changes, workspaceEdit };
       patched.forEach((h) => h(e));
       setDirty(d, before);
     },

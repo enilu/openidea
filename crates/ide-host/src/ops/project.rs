@@ -10,16 +10,22 @@ use std::sync::Arc;
 #[derive(Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectInfo {
+    pub trusted: bool,
     pub root: ide_core::IpcPath,
     pub name: String,
     pub is_git: bool,
     pub settings: Settings,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<ide_workspace::workspace::Workspace>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unity: Option<ide_workspace::unity::UnityProjectInfo>,
 }
 
 pub fn info(project: &Project) -> ProjectInfo {
     let settings = project.settings.effective();
     let custom = settings.general.project_name.trim();
     ProjectInfo {
+        trusted: project.is_trusted(),
         name: if custom.is_empty() {
             project.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
         } else {
@@ -28,6 +34,8 @@ pub fn info(project: &Project) -> ProjectInfo {
         is_git: !project.repos.read().is_empty(),
         settings,
         root: project.root.clone().into(),
+        workspace: ide_workspace::workspace::Workspace::load(&project.root).ok().flatten(),
+        unity: ide_workspace::unity::detect(&project.root),
     }
 }
 
@@ -51,6 +59,42 @@ pub fn settings(host: &Host, window: &str) -> Settings {
 
 pub fn roots(host: &Host, window: &str) -> IdeResult<ide_workspace::ProjectRoots> {
     Ok(host.project(window)?.roots())
+}
+
+pub fn save_workspace(host: &Host, window: &str, name: &str, paths: Vec<std::path::PathBuf>) -> IdeResult<ProjectInfo> {
+    let project = host.project(window)?;
+    ide_workspace::workspace::Workspace::save(&project.root, name, paths, false)?;
+    project.settings.reload();
+    project.refresh_index_scope();
+    project.refresh_repositories();
+    project.sink.emit(ide_core::IdeEvent::ProjectRootsChanged { root: project.root.clone().into() });
+    Ok(info(&project))
+}
+
+/// Links a folder, or prepares an automatic workspace for the caller to open in place.
+pub fn attach_workspace(host: &Host, window: &str, path: &Path) -> IdeResult<ide_core::IpcPath> {
+    let project = host.project(window)?;
+    let path = dunce::canonicalize(path)?;
+    if project.light {
+        return Err(ide_core::IdeError::invalid("Open a project before attaching a folder"));
+    }
+    if let Some(mut workspace) = ide_workspace::workspace::Workspace::load(&project.root)? {
+        if !workspace.projects.contains(&path) {
+            workspace.projects.push(path);
+            save_workspace(host, window, &workspace.name, workspace.projects)?;
+        }
+        return Ok(project.root.clone().into());
+    }
+    if path == project.root {
+        return Ok(project.root.clone().into());
+    }
+    Ok(ide_workspace::workspace::Workspace::create_for_project(
+        &host.data_dir,
+        &project.root,
+        &info(&project).name,
+        &path,
+    )?
+    .into())
 }
 
 /// What [`set_settings`] changed; the caller tells the windows.
@@ -107,6 +151,14 @@ pub fn set_settings(
         }
     }
     let affected = || if project_scope { current.iter().cloned().collect() } else { host.projects() };
+    if key == "editor" || key == "editor.encodings" || key == "editor.encodings.nativeToAscii" {
+        let affected = affected();
+        host.runtime.spawn_blocking(move || {
+            for project in affected {
+                project.documents.reload_properties();
+            }
+        });
+    }
     // File type associations re-detect open documents (off the command thread).
     if key == "files" || key.starts_with("files.fileType") {
         let affected = affected();
@@ -123,15 +175,30 @@ pub fn set_settings(
         host.apply_proxy();
     }
     // A new interpreter / toolchain / server executable restarts the language servers it affects.
-    if ["languages", "tools", "languageServers"].iter().any(|k| key == *k || key.starts_with(&format!("{k}."))) {
+    // So do inspections that are compiler options (`ide-sdk` `configure_java_compiler`).
+    let code_style = key == "editor"
+        || key == "editor.codeStyle"
+        || key.starts_with("editor.codeStyle.")
+        || key == "inspections"
+        || key.starts_with("inspections.");
+    let toolchain = ["languages", "tools", "languageServers", "languageServerTargets", "projectStructure"]
+        .iter()
+        .any(|k| key == *k || key.starts_with(&format!("{k}.")));
+    // Code style only reaches servers as settings (e.g. jdtls' formatter profile); builds don't depend on it.
+    if code_style || toolchain {
         for project in affected() {
+            if toolchain && let Some(bridge) = &project.kotlin_bridge {
+                bridge.schedule();
+            }
             let lsp = project.lsp.clone();
             host.runtime.spawn(async move { lsp.reconfigure().await });
         }
     }
     let roots_changed = key == "projectStructure"
         || key.starts_with("projectStructure.")
-        || "languages.java.maven.unlinkedProjects".starts_with(key);
+        || "languages.java.maven.unlinkedProjects".starts_with(key)
+        || "languages.java.maven.linkedProjects".starts_with(key)
+        || "languages.java.gradle.linkedProjects".starts_with(key);
     // Content roots and excludes (files.exclude, ignored names, excluded folders) reach the
     // index and the watchers without reopening the project (the rescan runs in the background).
     if roots_changed || key == "files" || key.starts_with("files.") {

@@ -7,11 +7,11 @@
  * Shift, `Ctrl Ctrl`…); pressed twice and held, then a key, `Alt Alt+Up`.
  * Keys are matched by physical position (`KeyboardEvent.code`), so ⌥-letter
  * combos work on macOS where `event.key` would be a symbol. Mouse shortcuts
- * name the button 1-based (`Button4` = back side button, `Button5` = forward),
+ * name the button 1-based (`Button1` = left, `Button4` = back side button, `Button5` = forward),
  * optionally with modifiers (`Alt+Button4`); they are single strokes.
  */
 import { create } from "zustand";
-import { getAction, isActionKeyEnabled, executeAction } from "./actions";
+import { executeAction, executeActionFrom, getAction, isActionKeyEnabled } from "./actions";
 import { getContext } from "./context";
 import { intellijMacos } from "./keymaps/intellij-macos";
 import { intellijWindows } from "./keymaps/intellij-windows";
@@ -21,6 +21,7 @@ import { vscodeMacos } from "./keymaps/vscode-macos";
 import { vscodeWindows } from "./keymaps/vscode-windows";
 import { usePlatform } from "./platformInfo";
 import { isImeKey } from "./ime";
+import { isPageSwipe, PAGE_SWIPE_EVENT } from "./pageSwipe";
 
 export type Keymap = Record<string, string[]>;
 
@@ -70,9 +71,11 @@ interface KeymapState {
   preset: string;
   /** User overrides: action id → bindings (empty array removes defaults). */
   overrides: Keymap;
+  /** Extensions' default bindings (plugins), below the preset. */
+  extensions: Keymap;
 }
 
-export const useKeymap = create<KeymapState>(() => ({ preset: defaultPreset(), overrides: {} }));
+export const useKeymap = create<KeymapState>(() => ({ preset: defaultPreset(), overrides: {}, extensions: {} }));
 
 const MOUSE_KEY_RE = /^Button(\d+)$/i;
 
@@ -83,14 +86,14 @@ export function isMouseBinding(binding: string): boolean {
 }
 
 /**
- * The mouse stroke of a press of a non-primary button: DOM `button` 3 / 4
- * (back / forward side buttons) → `Button4` / `Button5`. Left, middle and
- * right buttons have their own meaning everywhere, so they are not shortcuts.
+ * Side buttons, or a left click with Ctrl/Alt/Meta. Plain and Shift-only
+ * left clicks keep selection semantics; middle/right clicks keep their own meaning.
  */
 export function mouseStrokeOf(
   e: Pick<MouseEvent, "button" | "metaKey" | "ctrlKey" | "altKey" | "shiftKey">,
 ): string | null {
-  if (!Number.isInteger(e.button) || e.button < 3) return null;
+  if (!Number.isInteger(e.button) || e.button < 0) return null;
+  if (e.button < 3 && !(e.button === 0 && (e.ctrlKey || e.altKey || e.metaKey))) return null;
   const mods = [e.ctrlKey && "Ctrl", e.altKey && "Alt", e.shiftKey && "Shift", e.metaKey && "Meta"].filter(Boolean);
   return [...mods, `Button${e.button + 1}`].join("+");
 }
@@ -116,6 +119,9 @@ export function isValidBinding(binding: unknown): binding is string {
   const b = binding.trim();
   if (parseDoubleModifier(b)) return true;
   const strokes = b.split(/\s+/);
+  if (strokes.some((s) => /swipe(left|right)$/i.test(s))) {
+    return strokes.length === 1 && /^swipe(left|right)$/i.test(b);
+  }
   return strokes.length >= 1 && strokes.length <= 2 && strokes.every((s) => STROKE_RE.test(s));
 }
 
@@ -189,15 +195,59 @@ export function suspendKeyboardDispatch(): () => void {
 }
 
 export function bindingsFor(actionId: string): string[] {
-  const { preset, overrides } = useKeymap.getState();
-  return overrides[actionId] ?? PRESETS[preset]?.[actionId] ?? [];
+  const { preset, overrides, extensions } = useKeymap.getState();
+  return overrides[actionId] ?? PRESETS[preset]?.[actionId] ?? usableExtensionBindings(extensions)[actionId] ?? [];
 }
 
 /** Every (binding, actionId) pair of the effective keymap. */
 export function effectiveBindings(): Array<[string, string]> {
-  const { preset, overrides } = useKeymap.getState();
-  const merged: Keymap = { ...PRESETS[preset], ...overrides };
+  const { preset, overrides, extensions } = useKeymap.getState();
+  const merged: Keymap = { ...usableExtensionBindings(extensions), ...PRESETS[preset], ...overrides };
   return Object.entries(merged).flatMap(([id, keys]) => keys.map((k) => [normalizeBinding(k), id] as [string, string]));
+}
+
+let extensionCache: { source: Keymap; preset: string; overrides: Keymap; usable: Keymap } | null = null;
+
+/**
+ * Plugin default bindings that stay: those of actions the preset and the
+ * user leave unbound, on keystrokes nothing else uses (the IDE's own
+ * shortcuts always win).
+ */
+function usableExtensionBindings(extensions: Keymap | undefined = {}): Keymap {
+  const { preset, overrides } = useKeymap.getState();
+  if (
+    extensionCache?.source === extensions &&
+    extensionCache.preset === preset &&
+    extensionCache.overrides === overrides
+  )
+    return extensionCache.usable;
+  const builtIn: Keymap = { ...PRESETS[preset], ...overrides };
+  const taken = new Set(Object.values(builtIn).flatMap((keys) => keys.map(normalizeBinding)));
+  const usable: Keymap = {};
+  for (const [id, keys] of Object.entries(extensions)) {
+    if (id in builtIn) continue;
+    const free = keys.filter((k) => !taken.has(normalizeBinding(k)));
+    for (const k of free) taken.add(normalizeBinding(k));
+    if (free.length) usable[id] = free;
+  }
+  extensionCache = { source: extensions, preset, overrides, usable };
+  return usable;
+}
+
+/**
+ * Default bindings contributed by an extension (a plugin's `keymaps`), below
+ * the preset and the user's: dropped when the keystroke is already taken.
+ * Returns a disposer.
+ */
+export function registerExtensionBindings(actionId: string, bindings: string[]): () => void {
+  const valid = bindings.filter(isValidBinding);
+  useKeymap.setState((s) => ({ extensions: { ...(s.extensions ?? {}), [actionId]: valid } }));
+  return () =>
+    useKeymap.setState((s) => {
+      if (s.extensions?.[actionId] !== valid) return s;
+      const { [actionId]: _, ...rest } = s.extensions ?? {};
+      return { extensions: rest };
+    });
 }
 
 const MOD_ORDER = MODIFIERS;
@@ -214,6 +264,8 @@ export function normalizeBinding(binding: string): string {
       const key = parts.pop()!;
       const mods = MOD_ORDER.filter((m) => parts.some((p) => p.toLowerCase() === m.toLowerCase()));
       const mouse = MOUSE_KEY_RE.exec(key);
+      const swipe = /^swipe(left|right)$/i.exec(key);
+      if (swipe) return `Swipe${swipe[1]!.toLowerCase() === "left" ? "Left" : "Right"}`;
       return [...mods, mouse ? `Button${mouse[1]}` : key.length === 1 ? key.toUpperCase() : key].join("+");
     })
     .join(" ");
@@ -317,7 +369,8 @@ const KEY_LABELS: Record<string, string> = {
 export function formatBinding(binding: string, mac = isMacHost()): string {
   if (isMouseBinding(binding)) {
     const parts = normalizeBinding(binding).split("+");
-    const button = `${parts.pop()} Click`;
+    const key = parts.pop();
+    const button = key === "Button1" ? "Left Click" : `${key} Click`;
     return mac ? parts.map((p) => SYMBOLS[p] ?? p).join("") + button : [...parts, button].join("+");
   }
   if (!mac)
@@ -340,7 +393,7 @@ export function formatBinding(binding: string, mac = isMacHost()): string {
 
 /** The first keyboard binding of an action: what menus and tooltips show. */
 export function primaryKeyBinding(actionId: string): string | undefined {
-  return bindingsFor(actionId).find((b) => !isMouseBinding(b));
+  return bindingsFor(actionId).find((b) => !isMouseBinding(b) && !isPageSwipe(b));
 }
 
 export function shortcutLabel(actionId: string): string | undefined {
@@ -401,8 +454,26 @@ export function isAltGrTyping(
 function runIfEnabled(id: string): boolean {
   const action = getAction(id);
   if (!action || !isActionKeyEnabled(action)) return false;
-  void executeAction(id);
+  void executeActionFrom("keyboard", id);
   return true;
+}
+
+/** Run a configured mouse binding; editors prepare the clicked caret and focus first. */
+export function dispatchMouseShortcut(e: MouseEvent, prepare?: (id: string) => boolean, arg?: unknown): boolean {
+  if (suspended > 0) return false;
+  const stroke = mouseStrokeOf(e);
+  if (!stroke) return false;
+  const ids = effectiveBindings()
+    .filter(([b]) => b === stroke)
+    .map(([, id]) => id);
+  for (const id of ids.reverse()) {
+    const action = getAction(id);
+    if (!action || !isActionKeyEnabled(action)) continue;
+    if (prepare && !prepare(id)) return false;
+    void executeAction(id, arg);
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -458,7 +529,7 @@ export function installKeyboardDispatcher(
       e.preventDefault();
       e.stopPropagation();
       tap.keyUsed = true;
-      void executeAction(id);
+      void executeActionFrom("keyboard", id);
       return true;
     }
     return false;
@@ -507,7 +578,7 @@ export function installKeyboardDispatcher(
         e.preventDefault();
         e.stopPropagation();
         reset();
-        void executeAction(id);
+        void executeActionFrom("keyboard", id);
         return;
       }
     }
@@ -551,6 +622,15 @@ export function installKeyboardDispatcher(
     if (suspended > 0) return;
     const stroke = mouseStrokeOf(e);
     if (!stroke) return;
+    if (e.button === 0) {
+      // The editor sets the caret under the pointer before dispatching the action.
+      if (e.target instanceof Element && e.target.closest(".cm-content")) return;
+      if (!dispatchMouseShortcut(e)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      reset();
+      return;
+    }
     // Side buttons never reach the target (no editor selection, no focus change).
     e.preventDefault();
     e.stopPropagation();
@@ -568,23 +648,40 @@ export function installKeyboardDispatcher(
     e.stopPropagation();
   };
 
+  /** macOS force click: no system Look Up popover over IDE text; the editor navigates instead. */
+  const onForceWillBegin = (e: Event) => e.preventDefault();
+
   const onBlur = () => {
     reset();
     resetTap();
   };
 
+  const onSwipe = (event: Event) => {
+    const stroke = (event as CustomEvent).detail;
+    if (suspended > 0 || !isPageSwipe(stroke)) return;
+    reset();
+    resetTap();
+    const ids = effectiveBindings()
+      .filter(([binding]) => binding === stroke)
+      .map(([, id]) => id);
+    for (const id of ids.reverse()) if (runIfEnabled(id)) return;
+  };
+  target.addEventListener(PAGE_SWIPE_EVENT, onSwipe);
   target.addEventListener("keydown", onKeyDown, true);
   target.addEventListener("keyup", onKeyUp, true);
   target.addEventListener("mousedown", onMouseDown, true);
   target.addEventListener("mouseup", onMouseRelease, true);
   target.addEventListener("auxclick", onMouseRelease, true);
+  target.addEventListener("webkitmouseforcewillbegin", onForceWillBegin, true);
   target.addEventListener("blur", onBlur);
   return () => {
+    target.removeEventListener(PAGE_SWIPE_EVENT, onSwipe);
     target.removeEventListener("keydown", onKeyDown, true);
     target.removeEventListener("keyup", onKeyUp, true);
     target.removeEventListener("mousedown", onMouseDown, true);
     target.removeEventListener("mouseup", onMouseRelease, true);
     target.removeEventListener("auxclick", onMouseRelease, true);
+    target.removeEventListener("webkitmouseforcewillbegin", onForceWillBegin, true);
     target.removeEventListener("blur", onBlur);
   };
 }

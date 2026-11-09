@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { registerTextEditorWrapper, resolveFileEditor } from "@/workbench/contributions";
+import { activate as activateViewers } from "./index";
 import { binaryInput, formatSize, imageInput, isImagePath, isMarkdownPath, isSvgPath, wantsHexView } from "./fileKinds";
 import {
   BYTES_PER_ROW,
@@ -14,7 +16,7 @@ import {
   rowCount,
   scrollTopForRow,
 } from "./hex";
-import { fitZoom, initialZoom, stepZoom, zoomLabel } from "./imageZoom";
+import { fitZoom, initialZoom, stepZoom, zoomAt, zoomLabel } from "./imageZoom";
 
 describe("file kinds", () => {
   it("routes by extension", () => {
@@ -44,6 +46,22 @@ describe("file kinds", () => {
     expect(formatSize(512)).toBe("512 B");
     expect(formatSize(1536)).toBe("1.5 KB");
     expect(formatSize(300 * 1024 * 1024)).toBe("300 MB");
+  });
+
+  it("lets a text editor wrapper take precedence over the image viewer", async () => {
+    const offViewers = activateViewers();
+    const offWrapper = registerTextEditorWrapper({
+      id: "plugin.acme.diagram.canvas",
+      matches: (p) => p.endsWith(".diagram.svg"),
+      component: () => null,
+    });
+    try {
+      expect((await resolveFileEditor("/p/icon.svg"))?.input.kind).toBe("image");
+      expect(await resolveFileEditor("/p/arch.diagram.svg")).toBeNull();
+    } finally {
+      offWrapper();
+      offViewers();
+    }
   });
 });
 
@@ -95,5 +113,14 @@ describe("image zoom", () => {
     expect(initialZoom(50, 50, 100, 100)).toBe(1);
     expect(initialZoom(400, 100, 100, 100)).toBe(0.25);
     expect(zoomLabel(0.333)).toBe("33%");
+  });
+
+  it("keeps the point under the cursor fixed when zooming", () => {
+    const v = { z: 1, x: 10, y: 20 };
+    const next = zoomAt(v, 2, 110, 70);
+    // Image point under (110, 70) before: ((110-10)/1, (70-20)/1) = (100, 50).
+    expect(next).toEqual({ z: 2, x: -90, y: -30 });
+    expect(next.x + 100 * next.z).toBe(110);
+    expect(next.y + 50 * next.z).toBe(70);
   });
 });

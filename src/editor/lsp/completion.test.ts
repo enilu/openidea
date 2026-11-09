@@ -15,6 +15,7 @@ import {
 import {
   applyLspCompletion,
   callParens,
+  offersPaths,
   commitsLookup,
   completionExtension,
   explicitCompletion,
@@ -55,6 +56,27 @@ function item(over: Partial<CompletionItem> = {}): CompletionItem {
     ...over,
   };
 }
+
+describe("PHP construct completion documentation", () => {
+  const req = { doc: 1, path: "/p/a.php", language: "PHP", pos: 3, text: EditorState.create({ doc: "emp" }).doc };
+
+  it("documents a keyword without changing its insertion", () => {
+    const c = makeCompletion(item({ label: "empty", kind: "keyword", insertText: "empty" }), req);
+    expect(c.lsp.documentation?.value).toContain("empty(mixed $var): bool");
+    expect(c.lsp.insertText).toBe("empty");
+  });
+
+  it("preserves server documentation and leaves methods and other languages alone", () => {
+    const documentation = { kind: "markdown" as const, value: "Server documentation" };
+    expect(makeCompletion(item({ label: "empty", kind: "keyword", documentation }), req).lsp.documentation).toEqual(
+      documentation,
+    );
+    expect(makeCompletion(item({ label: "empty", kind: "method" }), req).lsp.documentation).toBeNull();
+    expect(
+      makeCompletion(item({ label: "empty", kind: "keyword" }), { ...req, language: "JavaScript" }).lsp.documentation,
+    ).toBeNull();
+  });
+});
 
 describe("toCmCompletion", () => {
   it("maps label, detail, kind and sort text", () => {
@@ -352,8 +374,24 @@ describe("insert parentheses", () => {
 
   it("skips calls that already have parentheses and imports", () => {
     expect(callParens(item(), line("a.cr(x)"), 2, 4)).toBeNull();
+    expect(callParens(item(), line("cr'"), 0, 2)).toBeNull();
+    expect(callParens(item(), line('cr"'), 0, 2)).toBeNull();
     expect(callParens(item(), line("import { cr"), 9, 11)).toBeNull();
     expect(callParens(item(), line("use crate::cr"), 11, 13)).toBeNull();
+  });
+});
+
+describe("file paths in strings", () => {
+  it("are offered in PHP and Blade only once the string reads like a path", () => {
+    expect(offersPaths("php", "config('app.")).toBe(false);
+    expect(offersPaths("php", "User::create(['na")).toBe(false);
+    expect(offersPaths("php", "require './")).toBe(true);
+    expect(offersPaths("blade", "@include('partials/")).toBe(true);
+  });
+
+  it("are offered as before in other languages", () => {
+    expect(offersPaths("typescript", "import x from 'mod")).toBe(true);
+    expect(offersPaths("rust", 'include_str!("da')).toBe(true);
   });
 });
 

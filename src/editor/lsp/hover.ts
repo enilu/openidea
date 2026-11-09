@@ -26,7 +26,7 @@ import { offsetToPos, rangeToOffsets } from "./positions";
 import { showHint } from "./hint";
 import { caretAnchor, focusPopup, openPopup, useLspPopup, type DefinitionTarget, type DocEntry } from "./popupStore";
 import { selectedLookupDoc, showLookupDocs } from "./completion";
-import { identifierAt, readFileLines, withDocument } from "./files";
+import { readFileLines, targetLabel, withDocument } from "./files";
 import { docWindowVisible, moveDocPopupToWindow, showInDocWindow } from "./docs";
 import { structure } from "@/editor/structure";
 import { basename } from "@/platform/project";
@@ -35,8 +35,14 @@ import { applyCodeAction, quickFixesAt } from "./intentions";
 import { editorPrefs } from "@/platform/editorSettings";
 import { CONTRIBUTED_HOVER, contributedAt, type ContributedHover } from "@/editor/api";
 import { navigationModifierHeld, onNavigationModifier, pointerTarget } from "@/platform/navigationModifier";
+import { languageSemantics } from "./semantic";
 
 let hoverRequest: RequestId | null = null;
+
+/** Documentation of a language construct (PHP's `empty`) at `pos`, via the language's registration. */
+function constructAt(state: EditorView["state"], pos: number, language: string | null | undefined) {
+  return languageSemantics(language)?.constructAt?.(state, pos) ?? null;
+}
 
 export async function requestHover(view: EditorView, pos: number): Promise<Hover | null> {
   const own = contributedAt<ContributedHover>(view.state, CONTRIBUTED_HOVER, pos);
@@ -48,6 +54,12 @@ export async function requestHover(view: EditorView, pos: number): Promise<Hover
   }
   const doc = docOf(view);
   if (!doc) return null;
+  const construct = constructAt(view.state, pos, doc.language);
+  if (construct)
+    return {
+      contents: { kind: "markdown", value: construct.markdown },
+      range: { start: offsetToPos(view.state.doc, construct.from), end: offsetToPos(view.state.doc, construct.to) },
+    };
   if (hoverRequest !== null && isTauri()) void commands.cancelRequest(hoverRequest);
   const id = (hoverRequest = nextRequestId());
   try {
@@ -91,7 +103,7 @@ function renderDiagnostics(view: EditorView, diags: PlacedDiagnostic[]): HTMLEle
     fix.className = "cm-lsp-link-button";
     const keys = shortcutLabel("code.showIntentions");
     fix.textContent = keys ? `More actions… ${keys}` : "More actions…";
-    if (d.severity === "error" || d.severity === "warning") offerQuickFix(view, meta, fix, from, to);
+    if (d.severity !== "hint") offerQuickFix(view, meta, fix, from, to);
     fix.addEventListener("mousedown", (e) => e.preventDefault());
     fix.addEventListener("click", () => {
       view.dispatch({ selection: EditorSelection.cursor(from) });
@@ -230,6 +242,13 @@ function showDoc(view: EditorView, entry: DocEntry, at: number) {
   });
 }
 
+export function showPhpConstructDocumentation(view: EditorView, pos: number): boolean {
+  const construct = constructAt(view.state, pos, docOf(view)?.language);
+  if (!construct) return false;
+  showDoc(view, { markup: { kind: "markdown", value: construct.markdown }, language: "PHP" }, construct.from);
+  return true;
+}
+
 /**
  * F1: documentation for the symbol at the caret in a popup (or the
  * Documentation tool window while it is open); in an open lookup, for its
@@ -263,7 +282,10 @@ export async function quickDocumentation(view: EditorView) {
       {
         markup: hover.contents,
         language: ctx?.uiMode ?? null,
-        source: ctx ? definitionOf(ctx.doc, offsetToPos(view.state.doc, pos)) : undefined,
+        source:
+          ctx && !constructAt(view.state, pos, ctx.language)
+            ? definitionOf(ctx.doc, offsetToPos(view.state.doc, pos))
+            : undefined,
       },
       hover.range ? rangeToOffsets(view.state.doc, hover.range).from : pos,
     );
@@ -309,7 +331,7 @@ async function definitionTarget(loc: Location, fallbackLanguage: string | null):
   const [lines, declaration] = await Promise.all([readFileLines(loc.path), declarationRange(loc)]);
   if (!lines) return null;
   const { first, last } = definitionSpan(loc, lines.length, declaration);
-  const name = identifierAt(lines[loc.range.start.line] ?? "", loc.range.start.col) ?? basename(loc.path);
+  const name = targetLabel(lines[loc.range.start.line] ?? "", loc.range.start.col) ?? basename(loc.path);
   return {
     location: loc,
     name,
@@ -327,6 +349,7 @@ export async function quickDefinition(view: EditorView, kind: "definition" | "ty
   const doc = docOf(view);
   if (!doc) return;
   const pos = view.state.selection.main.head;
+  if (kind === "definition" && showPhpConstructDocumentation(view, pos)) return;
   try {
     const found = await lspRequest(() => commands.lspGoto(doc.doc, offsetToPos(view.state.doc, pos), kind));
     const seen = new Set<string>();

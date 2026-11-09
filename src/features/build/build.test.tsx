@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen } from "@testing-library/react";
-import { getAction, isActionEnabled } from "@/platform/actions";
+import { executeAction, getAction, isActionEnabled } from "@/platform/actions";
 import { getContext, setContext } from "@/platform/context";
 import { bindingsFor } from "@/platform/keymap";
 import { IpcError, type BuildEvent, type BuildMessage, type BuildResult } from "@/platform/ipc";
@@ -16,6 +16,7 @@ import {
   type ToolWindowService,
 } from "@/workbench/contributions";
 import { useTasks } from "@/workbench/tasks";
+import { BuildTitleItem } from "./BuildTitleItem";
 import { BuildView } from "./BuildView";
 import { activate } from "./index";
 import {
@@ -86,13 +87,20 @@ describe("build model", () => {
 type Note = Parameters<NotificationService["notify"]>[0];
 
 class FakeBackend implements BuildBackend {
-  calls: Array<{ kind: string; file: string | null; clear: string[] }> = [];
+  calls: Array<{ kind: string; file: string | null; clear: string[]; cmake?: string }> = [];
   cancelled: number[] = [];
   private finish?: (r: BuildResult) => void;
   private fail?: (e: unknown) => void;
   emit?: (e: BuildEvent) => void;
-  run(kind: string, file: string | null, _request: number, clear: string[], onEvent: (e: BuildEvent) => void) {
-    this.calls.push({ kind, file, clear });
+  run(
+    kind: string,
+    file: string | null,
+    _request: number,
+    clear: string[],
+    onEvent: (e: BuildEvent) => void,
+    cmake: string | null,
+  ) {
+    this.calls.push({ kind, file, clear, ...(cmake ? { cmake } : {}) });
     this.emit = onEvent;
     return new Promise<BuildResult>((resolve, reject) => {
       this.finish = resolve;
@@ -150,6 +158,26 @@ describe("build feature", () => {
     setBuildBackend(null);
     useProject.setState({ project: null });
     setContext("projectOpen", false);
+    setContext("run.cmakeBuild", null);
+  });
+
+  it("shows the CMake hammer and builds the selected target through the shared action", async () => {
+    setContext("run.cmakeBuild", "cmake:release:hello:build");
+    render(<BuildTitleItem />);
+    expect(screen.getByRole("button", { name: "Build Project" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Build Project" }));
+    await act(async () => {});
+    expect(fake.calls.at(-1)).toMatchObject({ cmake: "cmake:release:hello:build" });
+    await act(async () => {
+      fake.resolve(result([], true));
+    });
+    const explicit = executeAction("build.buildProject", { cmake: "cmake:debug:other:build", activate: false });
+    await act(async () => {});
+    expect(fake.calls.at(-1)).toMatchObject({ cmake: "cmake:debug:other:build" });
+    await act(async () => {
+      fake.resolve(result([], true));
+      await explicit;
+    });
   });
 
   it("registers the Build menu actions, shortcuts and an on-use bottom tool window", () => {
@@ -173,7 +201,7 @@ describe("build feature", () => {
     await act(async () => {});
     expect(getContext()["build.running"]).toBe(true);
     expect(isActionEnabled(getAction("build.buildProject")!)).toBe(false);
-    expect(show).not.toHaveBeenCalled();
+    expect(show).toHaveBeenCalledWith("build", false);
     expect(useTasks.getState().tasks.some((t) => t.id === BUILD_TASK_ID && !t.done)).toBe(true);
     const messages = [err("/p/src/A.java", 11), warn("/p/src/B.java", 2)];
     await act(async () => {
@@ -213,7 +241,101 @@ describe("build feature", () => {
       await second;
     });
     expect(notes.at(-1)).toMatchObject({ level: "info", title: "Build completed successfully in 3 s" });
+    expect(show).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([
+    ["build.buildProject", undefined],
+    ["build.buildModule", "/p/core/src/A.java"],
+    ["build.rebuildProject", undefined],
+  ])("opens the Build window without focus when %s starts", async (id, arg) => {
+    const run = executeAction(id!, arg);
+    await act(async () => {});
+    expect(useBuildRun.getState().status).toBe("running");
+    expect(show).toHaveBeenCalledExactlyOnceWith("build", false);
+    expect(openFile).not.toHaveBeenCalled();
+    await act(async () => {
+      fake.resolve(result([], true));
+      await run;
+    });
     expect(show).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps before-launch builds hidden until a failure", async () => {
+    const run = executeAction("build.buildProject", { activate: false });
+    await act(async () => {});
+    expect(useBuildRun.getState().status).toBe("running");
+    expect(show).not.toHaveBeenCalled();
+    await act(async () => {
+      fake.resolve(result([], true));
+      await run;
+    });
+    expect(show).not.toHaveBeenCalled();
+
+    const failed = executeAction("build.buildProject", { activate: false });
+    await act(async () => {});
+    expect(show).not.toHaveBeenCalled();
+    const messages = [err("/p/src/A.java", 11)];
+    await act(async () => {
+      fake.resolve(result(messages, false));
+      await failed;
+    });
+    expect(show).toHaveBeenCalledExactlyOnceWith("build", false);
+    expect(useBuildRun.getState().selected).toBe(firstError(messages)!.key);
+    expect(openFile).toHaveBeenCalledWith(
+      "/p/src/A.java",
+      expect.objectContaining({ focus: true, selection: { line: 11, col: 4 } }),
+    );
+  });
+
+  it.each([
+    ["build.buildModule", { target: "/p/core", activate: false, wait: true }, "build", "/p/core"],
+    ["build.buildArtifacts", { activate: false, wait: true }, "artifacts", null],
+  ])("awaits %s only when requested and keeps its successful build hidden", async (id, arg, kind, file) => {
+    setContext("build.lastStatus", "success");
+    let finished = false;
+    const run = executeAction(id, arg).then(() => {
+      finished = true;
+    });
+    await act(async () => {});
+    expect(fake.calls.at(-1)).toMatchObject({ kind, file });
+    expect(finished).toBe(false);
+    expect(getContext()["build.lastStatus"]).toBeNull();
+    expect(show).not.toHaveBeenCalled();
+    await act(async () => {
+      fake.resolve(result([], true));
+      await run;
+    });
+    expect(finished).toBe(true);
+    expect(getContext()["build.lastStatus"]).toBe("success");
+    expect(show).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["build.buildModule", "/p/core"],
+    ["build.buildModule", undefined],
+    ["build.buildArtifacts", undefined],
+  ])("keeps ordinary %s calls nonblocking (%s)", async (id, arg) => {
+    await executeAction(id, arg);
+    expect(useBuildRun.getState().status).toBe("running");
+    expect(fake.calls.at(-1)?.file).toBe(arg ?? null);
+    await act(async () => {
+      fake.resolve(result([], true));
+    });
+  });
+
+  it("starts a build without a workbench", async () => {
+    show.mockImplementation(() => {
+      throw new Error("No workbench");
+    });
+    const run = startBuild("build");
+    await act(async () => {});
+    expect(fake.calls).toHaveLength(1);
+    await act(async () => {
+      fake.resolve(result([], true));
+      await run;
+    });
+    expect(useBuildRun.getState().status).toBe("success");
   });
 
   it("shows a message on single click and navigates on F4", async () => {

@@ -7,8 +7,40 @@ use tauri::{State, Window};
 
 #[tauri::command]
 #[specta::specta]
-pub fn fs_read_dir(window: Window, state: State<'_, AppState>, path: PathBuf) -> IdeResult<Vec<FileEntry>> {
-    fs::read_dir(&state.host, window.label(), path)
+pub async fn fs_entry_kind(state: State<'_, AppState>, path: PathBuf) -> IdeResult<ide_vfs::EntryKind> {
+    fs::entry_kind(&state.host, path).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn fs_compare_directories(
+    window: Window,
+    state: State<'_, AppState>,
+    left: PathBuf,
+    right: PathBuf,
+    request: ide_core::RequestId,
+    on_progress: tauri::ipc::Channel<ide_vfs::DirectoryCompareProgress>,
+) -> IdeResult<Vec<ide_vfs::DirectoryCompareEntry>> {
+    fs::compare_directories(&state.host, window.label(), left, right, request, super::sender(on_progress)).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn fs_copy_merge(
+    window: Window,
+    state: State<'_, AppState>,
+    source_root: PathBuf,
+    destination_root: PathBuf,
+    path: PathBuf,
+    overwrite: bool,
+) -> IdeResult<()> {
+    fs::copy_merge(&state.host, window.label(), source_root, destination_root, path, overwrite).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn fs_read_dir(window: Window, state: State<'_, AppState>, path: PathBuf) -> IdeResult<Vec<FileEntry>> {
+    fs::read_dir(&state.host, window.label(), path).await
 }
 
 /// Creates an empty file; inside a project, honours the EditorConfig
@@ -21,14 +53,20 @@ pub fn fs_create_file(window: Window, state: State<'_, AppState>, path: PathBuf)
 
 #[tauri::command]
 #[specta::specta]
+pub async fn fs_create_file_bytes(state: State<'_, AppState>, path: PathBuf, data: Vec<u8>) -> IdeResult<()> {
+    fs::create_file_bytes(&state.host, path, data).await
+}
+
+#[tauri::command]
+#[specta::specta]
 pub fn fs_create_dir(path: PathBuf) -> IdeResult<()> {
     ide_vfs::create_dir(&path)
 }
 
 #[tauri::command]
 #[specta::specta]
-pub fn fs_rename(from: PathBuf, to: PathBuf) -> IdeResult<()> {
-    ide_vfs::rename(&from, &to)
+pub async fn fs_rename(state: State<'_, AppState>, from: PathBuf, to: PathBuf) -> IdeResult<()> {
+    fs::rename(&state.host, from, to).await
 }
 
 /// Toggle Read-only Attribute: sets the writable bit (and the open document's

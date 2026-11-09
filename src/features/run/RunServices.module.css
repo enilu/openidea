@@ -29,3 +29,18 @@
   gap: 6px;
   padding: 0 12px 12px;
 }
+
+.debugConsole {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+}
+
+.importList {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  max-height: 320px;
+  overflow: auto;
+}

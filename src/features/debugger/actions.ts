@@ -1,10 +1,23 @@
 /** Debugger actions (ids match `keymaps/intellij-macos.ts`). */
+import { withRunTarget } from "@/platform/runTargetSelection";
 import { executeAction, getAction, registerActions, type Action } from "@/platform/actions";
-import { call, commands, isCancelled, isTauri, nextRequestId, type RunConfig, type RunId } from "@/platform/ipc";
+import {
+  call,
+  commands,
+  isCancelled,
+  isTauri,
+  nextRequestId,
+  type LaunchConfig,
+  type RunConfig,
+  type RunId,
+} from "@/platform/ipc";
 import { downloadJdkActions } from "@/platform/jdk";
 import { useProject } from "@/platform/project";
 import { activeEditor } from "@/editor/api";
+import type { EditorView } from "@codemirror/view";
 import { maybeEditorService, notifications, showStatusInfo, toolWindowService } from "@/workbench/contributions";
+import { classFileBreakpointReason } from "@/platform/classFiles";
+import { lineHasCode } from "./breakpoints/codeLines";
 import { canPlaceBreakpoint } from "./breakpoints/languages";
 import {
   removeAllBreakpoints,
@@ -17,11 +30,19 @@ import { removeAllSpecial, specialAt, toggleFieldAt, toggleMethodAt } from "./br
 import { fieldAt, methodAt } from "./breakpoints/symbols";
 import { toggleBreakpointSmart } from "./breakpoints/toggle";
 import { isJavaAttachTarget, isJavaDebuggable, javaAttachConfig, javaLaunchConfig } from "./java";
-import { reloadChangedClasses } from "./hotswap";
+import { cancelHotSwapBuild, reloadChangedClasses } from "./hotswap";
 import { debugUnsupportedReason, launchConfigFor } from "./launch";
-import { isRemoteConfig, REMOTE_JVM, remoteAttachConfig, remoteJvmTarget } from "./remote";
+import {
+  isPythonAttachTarget,
+  isRemoteConfig,
+  pythonAttachConfig,
+  REMOTE_JVM,
+  remoteAttachConfig,
+  remoteJvmTarget,
+} from "./remote";
 import {
   activeSession,
+  resumeExecution,
   evaluate,
   isLive,
   rerunSession,
@@ -30,13 +51,16 @@ import {
   sessionSupports,
   showExecutionPoint,
   startSession,
+  startPreparedSession,
   stopSession,
+  stopAssociatedProcess,
   useDebug,
   type DebugSession,
 } from "./state";
 import { focusedDebugView } from "./ui/focusedView";
 import { browseFocusedConsoleHistory } from "./ui/expressionHistory";
 import { expressionAt, valueHint } from "./editor/valueTooltip";
+import { mouseEvaluateTarget } from "./editor/quickEvaluate";
 import { showHint } from "@/editor/lsp/hint";
 import { pausedLineTargets, startInlineSmartStep } from "./editor/smartStep";
 import {
@@ -74,10 +98,21 @@ function pausedTarget(): { s: DebugSession; thread: number } | null {
   return thread == null ? null : { s, thread };
 }
 
+function breakpointPathAllowed(path: string): boolean {
+  const reason = classFileBreakpointReason(path);
+  if (!reason) return true;
+  showStatusInfo(tx(reason));
+  return false;
+}
+
 /** Run to Cursor at `line` (0-based) of `path` in the paused session. */
 export function runToLine(path: string, line: number) {
   const t = pausedTarget();
-  if (t) void report("Run to Cursor failed", call(commands.debugRunTo(t.s.id, t.thread, path, line, false)));
+  if (t && breakpointPathAllowed(path))
+    void report(
+      tx("Run to Cursor failed"),
+      resumeExecution(t.s.id, () => call(commands.debugRunTo(t.s.id, t.thread, path, line, false))),
+    );
 }
 
 function notSupported(what: string, s: DebugSession) {
@@ -103,15 +138,17 @@ async function smartStepInto() {
   if (!t) return;
   const frame = selectedFrame(t.s);
   if (!frame || !sessionSupports("stepInTargets", t.s)) {
-    await call(commands.debugStep(t.s.id, t.thread, "into"));
+    await resumeExecution(t.s.id, () => call(commands.debugStep(t.s.id, t.thread, "into")));
     return;
   }
   const targets = pausedLineTargets(await call(commands.debugStepInTargets(t.s.id, frame.id)));
   if (targets.length <= 1) {
-    await call(
-      targets[0]
-        ? commands.debugStepInTarget(t.s.id, t.thread, targets[0].id)
-        : commands.debugStep(t.s.id, t.thread, "into"),
+    await resumeExecution(t.s.id, () =>
+      call(
+        targets[0]
+          ? commands.debugStepInTarget(t.s.id, t.thread, targets[0].id)
+          : commands.debugStep(t.s.id, t.thread, "into"),
+      ),
     );
     return;
   }
@@ -147,28 +184,29 @@ function cursor(): { path: string; line: number; selection: string } | null {
 }
 
 /** Evaluate's initial text, as in IDEA: the selection, else the expression at the caret. */
-function evaluateSeed(): string {
-  const ed = activeEditor();
-  if (!ed) return "";
-  const { state } = ed.view;
+function evaluateSeed(view: EditorView | undefined = activeEditor()?.view, pos?: number): string {
+  if (!view) return "";
+  const { state } = view;
   const sel = state.selection.main;
-  if (!sel.empty) return state.sliceDoc(sel.from, sel.to);
-  return expressionAt(ed.view, sel.head)?.text ?? "";
+  if (!sel.empty && (pos == null || (sel.from <= pos && pos <= sel.to))) return state.sliceDoc(sel.from, sel.to);
+  return expressionAt(view, pos ?? sel.head)?.text ?? "";
 }
 
-async function quickEvaluate() {
-  const view = activeEditor()?.view;
+async function quickEvaluate(arg?: unknown) {
+  const target = mouseEvaluateTarget(arg);
+  const view = target?.view ?? activeEditor()?.view;
   if (!view) return;
   const sel = view.state.selection.main;
-  const expression = evaluateSeed().trim();
+  const pos = target?.pos ?? sel.from;
+  const expression = evaluateSeed(view, target?.pos).trim();
   if (!expression) return showHint(view, "Nothing to evaluate at the caret");
   const session = activeSession();
   try {
     const value = await evaluate(expression, "hover", session);
     if (!session) return;
-    showHint(view, () => valueHint(expression, value, session.id), { pos: sel.from, timeout: 60_000 });
+    showHint(view, () => valueHint(expression, value, session.id), { pos, timeout: 60_000 });
   } catch (e) {
-    showHint(view, e instanceof Error ? e.message : String(e), { pos: sel.from, tone: "error" });
+    showHint(view, e instanceof Error ? e.message : String(e), { pos, tone: "error" });
   }
 }
 
@@ -199,7 +237,7 @@ async function listenForJvm(name: string, host: string, port: number): Promise<n
 }
 
 /** Remote JVM Debug, Go Remote, Python / Node.js remote: attach over host:port. */
-async function startRemote(config: RunConfig, root: string) {
+async function startRemote(config: RunConfig, root: string, show?: boolean) {
   if (config.kind === REMOTE_JVM) {
     const t = remoteJvmTarget(config);
     let hostName = t.host;
@@ -211,17 +249,45 @@ async function startRemote(config: RunConfig, root: string) {
     }
     const launch = await javaAttachConfig({ name: config.name, module: t.module, hostName, port }, root);
     // A listen relay accepts one debugger: rerunning listens again through the configuration.
-    await startSession(launch, { runConfig: config, rerunnable: t.mode === "attach" });
+    await startSession(launch, { runConfig: config, rerunnable: t.mode === "attach", show });
     return;
   }
   const launch = remoteAttachConfig(config, root);
-  if (launch) await startSession(launch, { runConfig: config });
+  if (launch) await startSession(launch, { runConfig: config, show });
+}
+
+/** Preparation belongs to a session from the moment the action begins. */
+async function startJavaConfig(config: RunConfig, root: string, origin: RunConfig, show?: boolean) {
+  await startPreparedSession(
+    origin,
+    async (signal, report) => {
+      const request = nextRequestId();
+      const cancel = () => {
+        void commands.cancelRequest(request).catch(() => undefined);
+      };
+      signal.addEventListener("abort", cancel, { once: true });
+      try {
+        return await javaLaunchConfig(config, root, {
+          request,
+          signal,
+          report,
+          saveAll: async () => {
+            await maybeEditorService()?.saveAll();
+          },
+        });
+      } finally {
+        signal.removeEventListener("abort", cancel);
+      }
+    },
+    { show },
+  );
 }
 
 async function startConfig(arg: unknown) {
   const root = useProject.getState().project?.root;
   if (!root) return;
   const origin = arg && typeof arg === "object" && "origin" in arg && isRunConfig(arg.origin) ? arg.origin : null;
+  const show = arg && typeof arg === "object" && "show" in arg ? (arg as { show?: boolean }).show : undefined;
   const input = arg && typeof arg === "object" && "config" in arg ? arg.config : arg;
   let config: RunConfig | null = isRunConfig(input) ? input : null;
   if (!config) {
@@ -246,22 +312,26 @@ async function startConfig(arg: unknown) {
     config = configs[0]!;
     // Through Run's debug flow: Maven / Gradle / scripts start the JVM with a JDWP agent there.
     if (getAction("run.debugConfig")) {
-      await executeAction("run.debugConfig", config);
+      await executeAction("run.debugConfig", show === false ? { config, show: false } : config);
       return;
     }
   }
-  if (isRemoteConfig(config)) {
-    await startRemote(config, root);
+  config = withRunTarget(config);
+  if (!config.target?.startsWith("plugin-target:") && isRemoteConfig(config)) {
+    await startRemote(config, root, show);
     return;
   }
-  if (isJavaDebuggable(config)) {
-    await maybeEditorService()
-      ?.saveAll()
-      .catch(() => undefined);
-    await startSession(await javaLaunchConfig(config, root), { runConfig: origin ?? config });
+  if (!config.target?.startsWith("plugin-target:") && isJavaDebuggable(config)) {
+    await startJavaConfig(config, root, origin ?? config, show);
     return;
   }
-  const launch = launchConfigFor(config, root);
+  if (config.kind === "plugin") config = await call(commands.pluginPrepareDebugRun(config));
+  const dotnet = config.kind === "dotnet" && config.debugAdapter === "netcoredbg";
+  const prepared = dotnet ? await call(commands.runDotnetResolve(config, true)) : config;
+  // php-debug starts the PHP chosen in Settings unless the command names one.
+  const php =
+    config.debugAdapter === "php-debug" && isTauri() ? await call(commands.sdkPhpEffective()).catch(() => null) : null;
+  const launch = launchConfigFor(prepared, root, php);
   if (!launch) {
     notifications().notify({
       group: "run",
@@ -271,10 +341,44 @@ async function startConfig(arg: unknown) {
     });
     return;
   }
+  const pluginTarget = config.target?.startsWith("plugin-target:");
+  if (pluginTarget) {
+    const extra = JSON.parse(launch.extraJson ?? "{}");
+    extra.__runTarget = config.target;
+    launch.extraJson = JSON.stringify(extra);
+  }
+  const xdebugCheck =
+    !pluginTarget && config.debugAdapter === "php-debug" && isTauri() ? warnWithoutXdebug(launch) : null;
   await maybeEditorService()
     ?.saveAll()
     .catch(() => undefined);
-  await startSession(launch, { runConfig: origin ?? config });
+  const started = await startSession(launch, { runConfig: origin ?? config, show });
+  if (started && pluginTarget && config.debugAdapter === "php-debug") {
+    await executeAction("run.runConfig", config);
+  }
+  await xdebugCheck;
+}
+
+/**
+ * A PHP without the Xdebug extension ignores the `-dxdebug.*` options php-debug starts it with: the
+ * script runs past every breakpoint. Warns, without holding the session back (a command may load
+ * Xdebug itself with `-dzend_extension=`).
+ */
+async function warnWithoutXdebug(launch: LaunchConfig) {
+  const runtime = (JSON.parse(launch.extraJson ?? "{}") as { runtimeExecutable?: string }).runtimeExecutable;
+  // Without one, php-debug runs the `php` on the search path.
+  const php = runtime ?? (await call(commands.sdkLocateTools(["php"], null)).catch(() => null))?.tools[0]?.path;
+  // In the session's folder: a version manager's `php` shim picks the PHP from it.
+  const probe = php ? await call(commands.sdkPhpXdebug(php, launch.cwd)).catch(() => null) : null;
+  if (!probe || probe.xdebug) return;
+  notifications().notify({
+    group: "run",
+    level: "warning",
+    key: "debug.phpXdebug",
+    title: `Xdebug is not loaded in PHP ${probe.phpVersion}`,
+    body: tx`${probe.php} runs without Xdebug, so breakpoints are skipped. Install Xdebug 3 for this PHP or choose another PHP interpreter.`,
+    actions: [{ label: "Open PHP Settings", run: () => void executeAction("file.settings", "languages.php") }],
+  });
 }
 
 export function registerDebugActions(): () => void {
@@ -287,38 +391,89 @@ export function registerDebugActions(): () => void {
     when: paused,
     run: () => {
       const t = pausedTarget();
-      if (t) void report(title, call(commands.debugStep(t.s.id, t.thread, kind)));
+      if (t)
+        void report(
+          title,
+          resumeExecution(t.s.id, () => call(commands.debugStep(t.s.id, t.thread, kind))),
+        );
     },
   });
 
   return registerActions([
+    {
+      id: "debug.pluginStart",
+      title: "Debug Plugin Configuration",
+      category: "Debug",
+      hidden: true,
+      when: "projectOpen",
+      run: async ({ arg }) => {
+        const a = arg as { config: RunConfig; onExit: (code: number | null, stopped: boolean) => void };
+        const config = await call(commands.pluginPrepareDebugRun(a.config));
+        const root = useProject.getState().project?.root;
+        if (!root) throw new Error("No project");
+        const launch = launchConfigFor(config, root);
+        if (!launch) throw new Error("This configuration has no debugger");
+        let id: number | null = null;
+        let stopped = false;
+        const observe = () => {
+          if (id === null) return;
+          const session = useDebug.getState().sessions[id];
+          if (session?.status === "stopping") stopped = true;
+          if (!session || session.status === "terminated") {
+            off();
+            a.onExit(session?.exitCode ?? null, stopped);
+          }
+        };
+        const off = useDebug.subscribe(observe);
+        try {
+          await maybeEditorService()?.saveAll();
+          id = await startSession(launch, { runConfig: config });
+          if (id === null) {
+            off();
+            throw new Error("Debug session did not start");
+          }
+          observe();
+        } catch (error) {
+          off();
+          throw error;
+        }
+      },
+    },
     {
       id: "debug.startConfig",
       title: "Debug…",
       category: "Debug",
       icon: "debug",
       description: "Start debugging a run configuration",
-      run: ({ arg }) => report("Cannot start debugging", startConfig(arg)),
+      run: ({ arg }) => report(tx("Cannot start debugging"), startConfig(arg)),
     },
     {
       id: "debug.attach",
       title: "Attach Debugger",
       category: "Debug",
       hidden: true,
+      // Also debugpy to a Python program in a run target's container
+      // (arg: { name, adapter: "debugpy", hostName, port, remoteRoot, process }).
       description:
         "Attach the Java debugger to a JVM listening for JDWP (arg: { name, module, hostName, port, process })",
       run: ({ arg }) =>
         report(
-          "Cannot attach the debugger",
+          tx("Cannot attach the debugger"),
           (async () => {
             const root = useProject.getState().project?.root;
-            if (!root || !isJavaAttachTarget(arg)) return;
-            const launch = await javaAttachConfig(arg, root);
-            await startSession(launch, {
+            if (!root) return;
+            let launch: LaunchConfig;
+            if (isPythonAttachTarget(arg)) launch = pythonAttachConfig(arg, root);
+            else if (isJavaAttachTarget(arg)) launch = await javaAttachConfig(arg, root);
+            else return;
+            const session = await startSession(launch, {
               process: (arg.process ?? null) as RunId | null,
               runConfig: arg.runConfig,
               rerunnable: false,
+              show: (arg as { show?: boolean }).show,
             });
+            if (session == null && isPythonAttachTarget(arg) && arg.process != null)
+              await stopAssociatedProcess(arg.process);
           })(),
         ),
     },
@@ -341,7 +496,22 @@ export function registerDebugActions(): () => void {
       icon: "refresh",
       keywords: ["hotswap", "hot swap", "hot code replace"],
       when: "debugCanHotSwap",
-      run: () => reloadChangedClasses(),
+      run: ({ arg }) =>
+        reloadChangedClasses(
+          true,
+          typeof arg === "object" && arg !== null && "configId" in arg && typeof arg.configId === "string"
+            ? arg.configId
+            : undefined,
+        ),
+    },
+    {
+      id: "debug.cancelHotSwap",
+      title: "Cancel Hot Swap Build",
+      description: "Stop the compile a Reload Changed Classes action is waiting on",
+      category: "Debug",
+      icon: "stop",
+      when: "debugHotSwapBuilding",
+      run: () => cancelHotSwapBuild(),
     },
     {
       id: "debug.rerun",
@@ -364,7 +534,11 @@ export function registerDebugActions(): () => void {
       when: paused,
       run: () => {
         const t = pausedTarget();
-        if (t) void report("Resume failed", call(commands.debugResume(t.s.id, t.thread)));
+        if (t)
+          void report(
+            tx("Resume failed"),
+            resumeExecution(t.s.id, () => call(commands.debugResume(t.s.id, t.thread))),
+          );
       },
     },
     {
@@ -372,16 +546,40 @@ export function registerDebugActions(): () => void {
       title: "Pause Program",
       category: "Debug",
       icon: "pause",
-      when: "debugSessionActive && !debugSessionPaused",
+      when: "debugSessionRunning",
       run: async () => {
         const s = activeSession();
-        if (!s || !isLive(s)) return;
+        if (!s || s.status !== "running") return;
         let thread = s.selectedThread ?? s.threads[0]?.id;
         if (thread == null) {
           const threads = await call(commands.debugThreads(s.id)).catch(() => []);
           thread = threads[0]?.id ?? 0;
         }
-        await report("Pause failed", call(commands.debugPause(s.id, thread)));
+        await report(tx("Pause failed"), call(commands.debugPause(s.id, thread)));
+      },
+    },
+    {
+      id: "debug.hotReload",
+      title: "Hot Reload",
+      category: "Debug",
+      icon: "hot-reload",
+      description: "Flutter: inject the changed sources into the running app",
+      when: "debugSessionRunning && debugSessionDart",
+      run: () => {
+        const s = activeSession();
+        if (s) void report("Hot Reload failed", call(commands.debugHotReload(s.id)));
+      },
+    },
+    {
+      id: "debug.hotRestart",
+      title: "Hot Restart",
+      category: "Debug",
+      icon: "refresh",
+      description: "Flutter: restart the app, discarding its state",
+      when: "debugSessionRunning && debugSessionDart",
+      run: () => {
+        const s = activeSession();
+        if (s) void report("Hot Restart failed", call(commands.debugHotRestart(s.id)));
       },
     },
     step("debug.stepOver", "Step Over", "over", "step-over"),
@@ -396,7 +594,11 @@ export function registerDebugActions(): () => void {
       when: paused,
       run: () => {
         const t = pausedTarget();
-        if (t) void report("Force Step Over failed", call(commands.debugForceStepOver(t.s.id, t.thread)));
+        if (t)
+          void report(
+            tx("Force Step Over failed"),
+            resumeExecution(t.s.id, () => call(commands.debugForceStepOver(t.s.id, t.thread))),
+          );
       },
     },
     {
@@ -409,7 +611,11 @@ export function registerDebugActions(): () => void {
       when: paused,
       run: () => {
         const t = pausedTarget();
-        if (t) void report("Force Step Into failed", call(commands.debugStep(t.s.id, t.thread, "into")));
+        if (t)
+          void report(
+            tx("Force Step Into failed"),
+            resumeExecution(t.s.id, () => call(commands.debugStep(t.s.id, t.thread, "into"))),
+          );
       },
     },
     {
@@ -419,7 +625,7 @@ export function registerDebugActions(): () => void {
       icon: "smart-step-into",
       description: "Choose which call on the current line to step into",
       when: paused,
-      run: () => void report("Smart Step Into failed", smartStepInto()),
+      run: () => void report(tx("Smart Step Into failed"), smartStepInto()),
     },
     {
       id: "debug.showExecutionPoint",
@@ -448,7 +654,10 @@ export function registerDebugActions(): () => void {
           notSupported("Reset Frame", t.s);
           return;
         }
-        void report("Reset Frame failed", call(commands.debugRestartFrame(t.s.id, frame.id)));
+        void report(
+          tx("Reset Frame failed"),
+          resumeExecution(t.s.id, () => call(commands.debugRestartFrame(t.s.id, frame.id))),
+        );
       },
     },
     {
@@ -494,8 +703,11 @@ export function registerDebugActions(): () => void {
       run: () => {
         const t = pausedTarget();
         const c = cursor();
-        if (t && c)
-          void report("Run to Cursor failed", call(commands.debugRunTo(t.s.id, t.thread, c.path, c.line, false)));
+        if (t && c && breakpointPathAllowed(c.path))
+          void report(
+            tx("Run to Cursor failed"),
+            resumeExecution(t.s.id, () => call(commands.debugRunTo(t.s.id, t.thread, c.path, c.line, false))),
+          );
       },
     },
     {
@@ -508,8 +720,11 @@ export function registerDebugActions(): () => void {
       run: () => {
         const t = pausedTarget();
         const c = cursor();
-        if (t && c)
-          void report("Force Run to Cursor failed", call(commands.debugRunTo(t.s.id, t.thread, c.path, c.line, true)));
+        if (t && c && breakpointPathAllowed(c.path))
+          void report(
+            tx("Force Run to Cursor failed"),
+            resumeExecution(t.s.id, () => call(commands.debugRunTo(t.s.id, t.thread, c.path, c.line, true))),
+          );
       },
     },
     {
@@ -519,7 +734,7 @@ export function registerDebugActions(): () => void {
       icon: "breakpoint",
       run: () => {
         const c = cursor();
-        if (!c) return;
+        if (!c || !breakpointPathAllowed(c.path)) return;
         const exists = useBreakpoints.getState().byFile[c.path]?.some((b) => b.line === c.line);
         const language = activeEditor()?.ctx.language ?? "";
         if (!exists && !canPlaceBreakpoint(language)) {
@@ -532,6 +747,9 @@ export function registerDebugActions(): () => void {
           return;
         }
         const ed = activeEditor();
+        // Like IDEA, no new breakpoint on a blank or comment-only line; an existing one still goes.
+        const taken = exists || specialAt(c.path).some((b) => b.line === c.line);
+        if (!taken && ed && !lineHasCode(ed.view.state, c.line)) return;
         if (ed) toggleBreakpointSmart(c.path, c.line, language, ed.view.state.doc.toString());
         else toggleBreakpoint(c.path, c.line);
       },
@@ -544,7 +762,11 @@ export function registerDebugActions(): () => void {
       description: "A line breakpoint that is removed after it is hit",
       run: () => {
         const c = cursor();
-        if (c && canPlaceBreakpoint(activeEditor()?.ctx.language ?? "")) toggleTemporaryBreakpoint(c.path, c.line);
+        const ed = activeEditor();
+        if (!c || !breakpointPathAllowed(c.path) || !canPlaceBreakpoint(ed?.ctx.language ?? "", c.path)) return;
+        const exists = useBreakpoints.getState().byFile[c.path]?.some((b) => b.line === c.line);
+        if (!exists && ed && !lineHasCode(ed.view.state, c.line)) return;
+        toggleTemporaryBreakpoint(c.path, c.line);
       },
     },
     {
@@ -555,7 +777,7 @@ export function registerDebugActions(): () => void {
       run: () => {
         const ed = activeEditor();
         const c = cursor();
-        if (!ed || !c) return;
+        if (!ed || !c || !breakpointPathAllowed(c.path)) return;
         const existing = specialAt(c.path).find((b) => b.kind === "method" && b.line === c.line);
         const method = methodAt(ed.ctx.language, ed.view.state.doc.toString(), c.line);
         if (!existing && !method) {
@@ -578,7 +800,7 @@ export function registerDebugActions(): () => void {
       run: () => {
         const ed = activeEditor();
         const c = cursor();
-        if (!ed || !c) return;
+        if (!ed || !c || !breakpointPathAllowed(c.path)) return;
         const existing = specialAt(c.path).find((b) => b.kind === "field" && b.line === c.line);
         const field = fieldAt(ed.ctx.language, ed.view.state.doc.toString(), c.line);
         if (!existing && !field) {
@@ -643,8 +865,8 @@ export function registerDebugActions(): () => void {
       id: "debug.quickEvaluate",
       title: "Quick Evaluate Expression",
       category: "Debug",
-      when: "debugSessionActive && textEditorActive",
-      run: () => quickEvaluate(),
+      when: "debugSessionPaused && textEditorActive",
+      run: ({ arg }) => quickEvaluate(arg),
     },
     {
       id: "debug.showToolWindow",

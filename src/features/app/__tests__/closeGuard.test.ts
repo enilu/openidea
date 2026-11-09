@@ -12,12 +12,22 @@ function deps(answers: PromptResult[]) {
     }),
     saveAll: vi.fn(async () => {}),
     disableConfirmExit: vi.fn(async () => {}),
+    disableConfirmTerminate: vi.fn(async () => {}),
+    runningProcesses: vi.fn(async () => []),
     onSaveFailed: vi.fn(),
   };
   return { d, asked };
 }
 
-const base: CloseInput = { quitting: false, windows: 1, confirmExit: false, dirty: 0, project: "openidea" };
+const base: CloseInput = {
+  quitting: false,
+  windows: 1,
+  confirmExit: false,
+  confirmTerminate: false,
+  processes: [],
+  dirty: 0,
+  project: "openidea",
+};
 
 describe("decideClose", () => {
   it("closes silently when nothing needs asking", async () => {
@@ -47,6 +57,62 @@ describe("decideClose", () => {
     const { d, asked } = deps([]);
     await decideClose({ ...base, confirmExit: true, windows: 2 }, d);
     await decideClose({ ...base, confirmExit: true, quitting: true }, d);
+    expect(asked).toHaveLength(0);
+  });
+
+  it("stops the processes gracefully and waits for them before closing", async () => {
+    const { d } = deps([{ button: "terminate", checked: false }]);
+    d.terminate = vi.fn(async () => {});
+    d.waitForProcesses = vi.fn(async () => {});
+    await expect(decideClose({ ...base, confirmTerminate: true, processes: ["app"] }, d)).resolves.toBe(true);
+    expect(d.terminate).toHaveBeenCalledWith(false);
+    expect(d.waitForProcesses).toHaveBeenCalledOnce();
+  });
+
+  it("does not stop anything when the terminate prompt is cancelled", async () => {
+    const { d } = deps([{ button: "cancel", checked: false }]);
+    d.terminate = vi.fn(async () => {});
+    await expect(decideClose({ ...base, confirmTerminate: true, processes: ["app"] }, d)).resolves.toBe(false);
+    expect(d.terminate).not.toHaveBeenCalled();
+  });
+
+  it("asks before terminating a running process", async () => {
+    const { d, asked } = deps([{ button: "terminate", checked: false }]);
+    await expect(decideClose({ ...base, confirmTerminate: true, processes: ["app"] }, d)).resolves.toBe(true);
+    expect(asked).toHaveLength(1);
+    expect(asked[0]?.title).toContain("app");
+    expect(asked[0]?.body).toContain("app");
+  });
+
+  it("names every running process in the prompt", async () => {
+    const { d, asked } = deps([{ button: "terminate", checked: false }]);
+    await expect(decideClose({ ...base, confirmTerminate: true, processes: ["app", "worker"] }, d)).resolves.toBe(true);
+    expect(asked[0]?.body).toContain("app, worker");
+  });
+
+  it("cancelling the terminate prompt keeps the window", async () => {
+    const { d } = deps([{ button: "cancel", checked: false }]);
+    await expect(decideClose({ ...base, confirmTerminate: true, processes: ["app"] }, d)).resolves.toBe(false);
+  });
+
+  it("asks about processes before discarding unsaved changes", async () => {
+    const { d, asked } = deps([{ button: "cancel", checked: false }]);
+    await expect(decideClose({ ...base, confirmTerminate: true, processes: ["app"], dirty: 1 }, d)).resolves.toBe(
+      false,
+    );
+    expect(asked).toHaveLength(1);
+    expect(d.saveAll).not.toHaveBeenCalled();
+  });
+
+  it("'don't ask again' turns process confirmation off", async () => {
+    const { d } = deps([{ button: "terminate", checked: true }]);
+    await decideClose({ ...base, confirmTerminate: true, processes: ["app"] }, d);
+    expect(d.disableConfirmTerminate).toHaveBeenCalled();
+  });
+
+  it("does not ask about processes when the setting is off", async () => {
+    const { d, asked } = deps([]);
+    await decideClose({ ...base, confirmTerminate: false, processes: ["app"] }, d);
     expect(asked).toHaveLength(0);
   });
 
@@ -157,4 +223,34 @@ describe("decideClose", () => {
     expect(saved).toBe("disk baseline");
     expect(text).toBe("disk baseline");
   });
+});
+
+it("includes pending local edits and restored dirty buffers before backend dirty events", async () => {
+  const service = await import("@/workbench/contributions");
+  const { dirtyCount, installCloseGuard, confirmLeave } = await import("../closeGuard");
+  const { emitLocalIdeEvent } = await import("@/platform/ipc");
+  const { d, asked } = deps([{ button: "cancel", checked: false }]);
+  const uninstall = installCloseGuard(d);
+  const spy = vi.spyOn(service, "maybeEditorService").mockReturnValue({ dirtyDocumentIds: () => [10, 11] } as never);
+  try {
+    emitLocalIdeEvent({ type: "docDirty", doc: 11, dirty: true });
+    emitLocalIdeEvent({ type: "docDirty", doc: 12, dirty: true });
+    expect(dirtyCount()).toBe(3);
+    await expect(confirmLeave(d)).resolves.toBe(false);
+    expect(asked[0]?.body).toContain("3");
+  } finally {
+    emitLocalIdeEvent({ type: "docDirty", doc: 11, dirty: false });
+    emitLocalIdeEvent({ type: "docDirty", doc: 12, dirty: false });
+    uninstall();
+    spy.mockRestore();
+  }
+});
+
+it("confirmLeave asks about running processes before closing", async () => {
+  const { confirmLeave } = await import("../closeGuard");
+  const { d, asked } = deps([{ button: "cancel", checked: false }]);
+  d.runningProcesses = vi.fn(async () => ["app"]);
+  await expect(confirmLeave(d, "openidea")).resolves.toBe(false);
+  expect(asked[0]?.title).toContain("app");
+  expect(asked[0]?.body).toContain("app");
 });

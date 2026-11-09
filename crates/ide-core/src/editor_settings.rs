@@ -12,6 +12,8 @@ use std::collections::BTreeMap;
 pub struct EditorGeneralSettings {
     /// Change font size with ⌘ + mouse wheel.
     pub wheel_zoom: bool,
+    pub markdown_image_folder: String,
+    pub markdown_image_name_pattern: String,
     /// Drag-and-drop of selected text inside the editor.
     pub drag_and_drop: bool,
     /// When the caret moves out of view: `minimize` scrolling | `center` the caret line.
@@ -35,6 +37,8 @@ impl Default for EditorGeneralSettings {
     fn default() -> Self {
         Self {
             wheel_zoom: false,
+            markdown_image_folder: "assets".into(),
+            markdown_image_name_pattern: "image-{timestamp}".into(),
             drag_and_drop: true,
             caret_scroll: "minimize".into(),
             soft_wrap_files: "*.md; *.txt; *.rst; *.adoc".into(),
@@ -162,6 +166,16 @@ impl Default for CompletionSettings {
 pub struct AutoImportSettings {
     pub add_unambiguous: bool,
     pub optimize_on_the_fly: bool,
+    pub imports_on_paste: ImportsOnPaste,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum ImportsOnPaste {
+    #[default]
+    Ask,
+    Always,
+    Never,
 }
 
 /// Editor › General › Code Folding.
@@ -247,7 +261,10 @@ pub struct SmartKeysSettings {
     pub tab_out_of_pair: bool,
     /// Reformat on paste: `none` | `indentBlock` | `indentEachLine`.
     pub reformat_on_paste: String,
+    pub escape_on_paste: bool,
     pub smart_indent: bool,
+    /// Enter › Insert documentation comment stub: Enter after `/**` closes the comment.
+    pub insert_doc_stub: bool,
     /// Backspace › Unindent: `autoindent` (proper indent position) | `nearest` indent position | `none`.
     pub backspace_unindent: String,
 }
@@ -262,7 +279,9 @@ impl Default for SmartKeysSettings {
             surround_selection: true,
             tab_out_of_pair: true,
             reformat_on_paste: "indentEachLine".into(),
+            escape_on_paste: true,
             smart_indent: true,
+            insert_doc_stub: true,
             backspace_unindent: "autoindent".into(),
         }
     }
@@ -367,6 +386,12 @@ pub struct TextAttributesOverride {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, Type)]
 #[serde(default, rename_all = "camelCase")]
 pub struct LanguageCodeStyle {
+    /// Java formatter: `default` | `intellij` | `custom` (other languages ignore it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub formatter: Option<String>,
+    /// Eclipse formatter XML; relative paths start at the project root.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub formatter_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub use_tab: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -434,6 +459,8 @@ pub struct EncodingSettings {
     pub project: String,
     /// Fallback for `.properties` files.
     pub properties: String,
+    /// Display properties Unicode escapes as characters and save non-ASCII as escapes.
+    pub native_to_ascii: bool,
     /// Create UTF-8 files: `never` (no BOM) | `always` (with BOM) | `windows` (with BOM on Windows).
     pub utf8_bom: String,
 }
@@ -444,7 +471,29 @@ impl Default for EncodingSettings {
             global: "utf-8".into(),
             project: "utf-8".into(),
             properties: "iso-8859-1".into(),
+            native_to_ascii: false,
             utf8_bom: "never".into(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod auto_import_tests {
+    use super::{AutoImportSettings, ImportsOnPaste};
+
+    #[test]
+    fn imports_on_paste_defaults_to_ask_for_existing_settings() {
+        let settings: AutoImportSettings = serde_json::from_str(r#"{"addUnambiguous":true}"#).unwrap();
+        assert!(settings.add_unambiguous);
+        assert_eq!(settings.imports_on_paste, ImportsOnPaste::Ask);
+    }
+
+    #[test]
+    fn imports_on_paste_modes_round_trip() {
+        for mode in ["ask", "always", "never"] {
+            let json = serde_json::json!({ "importsOnPaste": mode });
+            let settings: AutoImportSettings = serde_json::from_value(json).unwrap();
+            assert_eq!(serde_json::to_value(settings).unwrap()["importsOnPaste"], mode);
         }
     }
 }

@@ -4,6 +4,7 @@
  * The backend keeps them across sessions and returns verification states.
  */
 import { create } from "zustand";
+import { useProject } from "@/platform/project";
 import { call, commands, isTauri } from "@/platform/ipc";
 import {
   makeBreakpoint,
@@ -94,6 +95,8 @@ export function loadBreakpoints(root: string | null) {
 const timers = new Map<string, ReturnType<typeof setTimeout>>();
 /** Ids in the order last sent per file (backend states are index-aligned). */
 const sent = new Map<string, string[]>();
+const inFlight = new Map<string, Promise<void>>();
+let flushing: Promise<void> | null = null;
 const SYNC_DELAY = 120;
 
 export function scheduleSync(path: string) {
@@ -102,25 +105,53 @@ export function scheduleSync(path: string) {
     path,
     setTimeout(() => {
       timers.delete(path);
-      void syncFile(path);
+      void syncFile(path).catch((e) => console.warn("debugSetBreakpoints failed", e));
     }, SYNC_DELAY),
   );
 }
 
-export async function syncFile(path: string) {
-  if (!isTauri()) return;
+/** Drain debounced edits before the backend takes its startup breakpoint snapshot. */
+export function flushBreakpoints(): Promise<void> {
+  // Concurrent session starts must not keep adding work to each other's drain.
+  if (flushing) return flushing;
+  flushing = drainBreakpoints().finally(() => {
+    flushing = null;
+  });
+  return flushing;
+}
+
+async function drainBreakpoints() {
+  let paths = new Set([...timers.keys(), ...inFlight.keys(), ...Object.keys(useBreakpoints.getState().byFile)]);
+  while (paths.size) {
+    for (const timer of timers.values()) clearTimeout(timer);
+    timers.clear();
+    await Promise.all([...paths].map((path) => syncFile(path)));
+    paths = new Set([...timers.keys(), ...inFlight.keys()]);
+  }
+}
+
+export function syncFile(path: string): Promise<void> {
+  const previous = inFlight.get(path) ?? Promise.resolve();
+  const next = previous.catch(() => {}).then(() => sendFile(path));
+  inFlight.set(path, next);
+  void next
+    .finally(() => {
+      if (inFlight.get(path) === next) inFlight.delete(path);
+    })
+    .catch(() => {});
+  return next;
+}
+
+async function sendFile(path: string) {
+  if (!isTauri() || useProject.getState().project?.trusted === false) return;
   const { byFile, muted } = useBreakpoints.getState();
   const list = byFile[path] ?? [];
   sent.set(
     path,
     list.map((b) => b.id),
   );
-  try {
-    const states = await call(commands.debugSetBreakpoints(path, toBackend(list, muted, path)));
-    applyStates(path, states);
-  } catch (e) {
-    console.warn("debugSetBreakpoints failed", e);
-  }
+  const states = await call(commands.debugSetBreakpoints(path, toBackend(list, muted, path)));
+  applyStates(path, states);
 }
 
 /** Re-reads verification states after a `breakpointsChanged` event. */

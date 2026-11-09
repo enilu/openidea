@@ -111,6 +111,17 @@ fn discover_outside_and_inside() {
 }
 
 #[test]
+fn discover_sha256_repository() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("work");
+    std::fs::create_dir(&dir).unwrap();
+    git_in(&dir, &["init", "-q", "--object-format=sha256"]);
+    let repo = Repo::discover(&dir).unwrap().unwrap();
+    assert_eq!(std::fs::canonicalize(repo.root()).unwrap(), std::fs::canonicalize(&dir).unwrap());
+    assert!(repo.status().unwrap().is_empty());
+}
+
+#[test]
 fn repository_without_commits() {
     let fx = Fixture::new();
     fx.write("new.txt", "hello\n");
@@ -175,6 +186,9 @@ fn status_matrix() {
     fx.write("staged_del.txt", "a\n");
     fx.write("rename_me.txt", "some longer content\nthat is stable\nfor rename detection\n");
     fx.write("both.txt", "a\n");
+    // A committed file the IDE ignores keeps its history but drops out of the change list.
+    fx.write("tracked.pyc", "a\n");
+    fx.git(&["add", "-f", "tracked.pyc"]);
     fx.commit_all("base");
 
     fx.write("modified.txt", "b\n");
@@ -195,6 +209,10 @@ fn status_matrix() {
     fx.write(".DS_Store", "junk");
     fx.write("dir/.DS_Store", "junk");
     fx.write("pkg/__pycache__/m.pyc", "junk");
+    fx.write("tracked.pyc", "b\n");
+    // Contents differ from `staged_del.txt` so rename detection cannot pair them.
+    fx.write("staged_ignored.pyc", "cached\nbytecode\n");
+    fx.git(&["add", "-f", "staged_ignored.pyc"]);
 
     let repo = fx.repo();
     repo.set_ignored_names(ide_core::settings::Settings::default().ignored_names());
@@ -217,6 +235,10 @@ fn status_matrix() {
     assert_eq!(status_of(&st, "renamed.txt").renamed_from.as_deref(), Some("rename_me.txt"));
     assert!(!st.iter().any(|s| s.rel_path == "rename_me.txt"), "rename source listed: {st:#?}");
     assert!(!st.iter().any(|s| s.rel_path.contains("debug.log") || s.rel_path.contains("build")));
+    assert!(
+        !st.iter().any(|s| s.rel_path.contains("tracked.pyc") || s.rel_path.contains("staged_ignored.pyc")),
+        "{st:#?}"
+    );
     assert!(!st.iter().any(|s| s.rel_path.contains(".DS_Store") || s.rel_path.contains("pkg")), "{st:#?}");
     // Sorted by path.
     let paths: Vec<_> = st.iter().map(|s| s.rel_path.clone()).collect();
@@ -419,7 +441,7 @@ fn blame_with_unsaved_edits() {
     let second = fx.commit_all("second");
     let repo = fx.repo();
 
-    let lines = repo.blame(&fx.path("b.txt"), None, encoding_rs::UTF_8).unwrap();
+    let lines = repo.blame(&fx.path("b.txt"), None, None, encoding_rs::UTF_8).unwrap();
     assert_eq!(lines.len(), 3);
     assert_eq!(lines[0].commit, first);
     assert_eq!(lines[1].commit, second);
@@ -427,7 +449,7 @@ fn blame_with_unsaved_edits() {
     assert_eq!(lines[0].author, "Test User");
     assert!(lines[0].time_ms > 1.0e12);
 
-    let lines = repo.blame(&fx.path("b.txt"), Some("one\nedited\nthree\nfour"), encoding_rs::UTF_8).unwrap();
+    let lines = repo.blame(&fx.path("b.txt"), Some("one\nedited\nthree\nfour"), None, encoding_rs::UTF_8).unwrap();
     assert_eq!(lines.len(), 4);
     assert_eq!(lines[0].commit, first);
     assert!(lines[1].commit.bytes().all(|b| b == b'0'));
@@ -435,9 +457,38 @@ fn blame_with_unsaved_edits() {
     assert_eq!(lines[2].commit, first);
     assert_eq!(lines[3].author, "Not Committed Yet");
 
-    let lines = repo.blame(&fx.path("untracked.txt"), Some("x\ny\n"), encoding_rs::UTF_8).unwrap();
+    let lines = repo.blame(&fx.path("untracked.txt"), Some("x\ny\n"), None, encoding_rs::UTF_8).unwrap();
     assert_eq!(lines.len(), 2);
     assert!(lines.iter().all(|l| l.author == "Not Committed Yet"));
+}
+
+#[test]
+fn blame_against_another_revision() {
+    // The merge view blames each side pane on the branch it belongs to: lines that
+    // only exist on the merged branch show their real history, not "Not Committed Yet".
+    let fx = Fixture::new();
+    fx.write("b.txt", "one\nthree\n");
+    let first = fx.commit_all("first");
+    fx.write("b.txt", "one\nTWO\nthree\n");
+    fx.commit_all("second");
+    fx.git(&["checkout", "-q", "-b", "feature", &first]);
+    fx.write("b.txt", "one\nfeature\nthree\n");
+    let feature = fx.commit_all("feature line");
+    fx.git(&["checkout", "-q", "main"]);
+    let repo = fx.repo();
+
+    // Blaming the feature content against HEAD marks its extra line uncommitted…
+    let text = "one\nfeature\nthree\n";
+    let lines = repo.blame(&fx.path("b.txt"), Some(text), Some("HEAD"), encoding_rs::UTF_8).unwrap();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0].commit, first);
+    assert_eq!(lines[1].author, "Not Committed Yet");
+    assert_eq!(lines[2].commit, first);
+    // …while blaming it against the feature commit resolves its real history.
+    let lines = repo.blame(&fx.path("b.txt"), Some(text), Some(&feature), encoding_rs::UTF_8).unwrap();
+    assert_eq!(lines[1].commit, feature);
+    assert_eq!(lines[1].summary, "feature line");
+    assert!(repo.blame(&fx.path("b.txt"), Some(text), Some("no-such-ref"), encoding_rs::UTF_8).is_err());
 }
 
 #[test]
@@ -543,6 +594,42 @@ fn commit_files_kinds() {
     assert!(repo.commit_files("HEAD").unwrap().len() == 4);
 }
 
+/// Line counts follow the same first-parent diff as the commit's file list, including renames.
+#[test]
+fn diff_numstat_counts_added_deleted_and_renames() {
+    let fx = Fixture::new();
+    fx.write("keep.txt", "a\nb\nc\n");
+    fx.write("mod.txt", "m\n");
+    fx.write("old.txt", "a fairly long line of content\nanother line\nand a third\n");
+    let root = fx.commit_all("root");
+    fx.write("mod.txt", "m\nmore\n");
+    std::fs::remove_file(fx.path("keep.txt")).unwrap();
+    fx.write("fresh.txt", "n1\nn2\n");
+    fx.git(&["mv", "old.txt", "new.txt"]);
+    fx.write("new.txt", "a fairly long line of content\nanother line\nchanged\n");
+    let c = fx.commit_all("changes");
+    let repo = fx.repo();
+
+    let stats = repo.diff_numstat(&root, &c, &[]).unwrap();
+    let find = |p: &str| stats.iter().find(|f| f.path == p).unwrap_or_else(|| panic!("{p}: {stats:#?}"));
+    assert_eq!((find("mod.txt").added, find("mod.txt").removed), (1, 0));
+    assert_eq!((find("keep.txt").added, find("keep.txt").removed), (0, 3));
+    assert_eq!((find("fresh.txt").added, find("fresh.txt").removed), (2, 0));
+    assert_eq!(find("new.txt").old_path.as_deref(), Some("old.txt"));
+    assert_eq!((find("new.txt").added, find("new.txt").removed), (1, 1));
+
+    let only = repo.diff_numstat(&root, &c, &["mod.txt".into()]).unwrap();
+    assert_eq!(only.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), vec!["mod.txt"]);
+    // The log passes both names, which is what lets git still report the rename.
+    let renamed = repo.diff_numstat(&root, &c, &["old.txt".into(), "new.txt".into()]).unwrap();
+    assert_eq!(renamed.len(), 1, "{renamed:#?}");
+    assert_eq!(renamed[0].old_path.as_deref(), Some("old.txt"));
+    assert_eq!((renamed[0].added, renamed[0].removed), (1, 1));
+
+    let created = repo.diff_numstat("4b825dc642cb6eb9a060e54bf8d69288fbee4904", &root, &["mod.txt".into()]).unwrap();
+    assert_eq!((created[0].added, created[0].removed), (1, 0));
+}
+
 /// IDEA's multi-commit Git Log selection: per file, before the first commit touching it ↔
 /// after the last one, contiguous or not.
 #[test]
@@ -631,6 +718,8 @@ fn file_at_in_a_blobless_clone() {
     fx.write("f.txt", "v2\n");
     fx.commit_all("v2");
     fx.git(&["config", "uploadpack.allowFilter", "true"]);
+    // Git refuses a clone source with a local hooks-path override.
+    fx.git(&["config", "--unset", "core.hooksPath"]);
     let clone = fx.dir.parent().unwrap().join("clone");
     let url = format!("file://{}", fx.dir.display());
     git_in(fx.dir.parent().unwrap(), &["clone", "-q", "--filter=blob:none", &url, "clone"]);
@@ -1115,6 +1204,71 @@ fn partial_commit_of_chosen_hunks_leaves_worktree_and_index_alone() {
 }
 
 #[test]
+fn pending_changes_show_what_the_commit_would_hold_without_touching_the_index() {
+    let fx = Fixture::new();
+    let base = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n";
+    fx.write("f.txt", base);
+    fx.write("staged.txt", "s\n");
+    fx.write("old.txt", "moved\nfile\nwith\nlines\n");
+    fx.write("bin.dat", "\0\x01");
+    fx.commit_all("base");
+    let repo = fx.repo();
+    let utf8 = |_: &Path| -> ide_core::IdeResult<&encoding_rs::Encoding> { Ok(encoding_rs::UTF_8) };
+
+    let edited = "A\nb\nc\nd\ne\nf\ng\nh\ni\nJ\n";
+    fx.write("f.txt", edited);
+    fx.write("staged.txt", "s2\n");
+    fx.git(&["add", "staged.txt"]);
+    fx.git(&["mv", "old.txt", "new.txt"]);
+    fx.write("bin.dat", "\0\x02");
+    fx.write("added.txt", "new\n");
+    let index_before = std::fs::read(fx.dir.join(".git/index")).unwrap();
+
+    // The index as it is: the staged file and the rename.
+    let plain = repo.pending_changes(&CommitOptions::default(), 1 << 20, &utf8).unwrap();
+    let summary: Vec<_> = plain
+        .iter()
+        .map(|c| (c.status, c.path.strip_prefix(&fx.dir).unwrap().to_string_lossy().into_owned()))
+        .collect();
+    assert_eq!(summary, [("renamed", "new.txt".to_owned()), ("modified", "staged.txt".to_owned())]);
+    assert_eq!(plain[0].old_path.as_deref(), Some(fx.path("old.txt").as_path()));
+    assert!(plain[1].diff.as_deref().unwrap().contains("-s\n+s2\n"), "{:?}", plain[1].diff);
+
+    // A selection: the first hunk of f.txt, the binary and the new file, staged.txt left out.
+    let hunks = diff_hunks(base, edited);
+    let options = CommitOptions {
+        partial: vec![PartialCommitFile { path: fx.path("f.txt").into(), hunks: vec![range(&hunks[0])] }],
+        stage: vec![fx.path("bin.dat").into(), fx.path("added.txt").into()],
+        exclude: vec![fx.path("staged.txt").into()],
+        ..Default::default()
+    };
+    let picked = repo.pending_changes(&options, 1 << 20, &utf8).unwrap();
+    let by_name = |name: &str| picked.iter().find(|c| c.path == fx.path(name)).unwrap_or_else(|| panic!("{name}"));
+    assert!(picked.iter().all(|c| c.path != fx.path("staged.txt")));
+    assert_eq!(by_name("added.txt").status, "added");
+    assert_eq!(by_name("bin.dat").diff, None);
+    let f = by_name("f.txt").diff.clone().unwrap();
+    assert!(f.starts_with("diff --git a/f.txt b/f.txt\n"), "{f}");
+    assert!(f.contains("-a\n+A\n") && !f.contains("+J"), "{f}");
+
+    // Nothing changed: the index, the working tree, no temporary index left behind.
+    assert_eq!(std::fs::read(fx.dir.join(".git/index")).unwrap(), index_before);
+    assert_eq!(fx.read("f.txt"), edited);
+    let leftovers: Vec<_> = std::fs::read_dir(fx.dir.join(".git"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("openidea-"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+
+    // The size limit cuts at a line and says so.
+    let cut = repo.pending_changes(&options, 40, &utf8).unwrap();
+    let total: usize = cut.iter().filter_map(|c| c.diff.as_ref()).map(String::len).sum();
+    assert!(total <= 40 && cut.iter().any(|c| c.truncated));
+    assert!(cut.iter().filter_map(|c| c.diff.as_ref()).all(|d| d.is_empty() || d.ends_with('\n')));
+}
+
+#[test]
 fn partial_staging_with_built_patch() {
     let fx = Fixture::new();
     let base = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\n";
@@ -1207,6 +1361,62 @@ fn errors_carry_git_messages() {
 }
 
 #[test]
+fn packed_refs_reload_without_a_newer_modification_time() {
+    for keep_time in [false, true] {
+        for linked in [false, true] {
+            let fx = Fixture::new();
+            fx.write("file.txt", "one\n");
+            let first = fx.commit_all("one");
+            fx.git(&["branch", "-m", "master"]);
+            let root = if linked {
+                let path = fx._tmp.path().join("linked");
+                fx.git(&["worktree", "add", "-qb", "agent/check", path.to_str().unwrap()]);
+                path
+            } else {
+                fx.dir.clone()
+            };
+            let packed = fx.path(".git/packed-refs");
+            std::fs::write(
+                &packed,
+                format!("# pack-refs with: peeled fully-peeled sorted \n{first} refs/remotes/origin/master\n"),
+            )
+            .unwrap();
+            let set_modified = |time| {
+                std::fs::OpenOptions::new().write(true).open(&packed).unwrap().set_modified(time).unwrap();
+            };
+            set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600));
+            let original_time = std::fs::metadata(&packed).unwrap().modified().unwrap();
+            let original_len = std::fs::metadata(&packed).unwrap().len();
+            let repo = Repo::discover(&root).unwrap().unwrap();
+            let query = LogQuery { branches: vec!["HEAD".into()], limit: 1, ..Default::default() };
+            assert_eq!(repo.log(&query).unwrap()[0].id, first);
+
+            std::fs::write(root.join("file.txt"), "two\n").unwrap();
+            git_in(&root, &["add", "file.txt"]);
+            git_in(&root, &["commit", "-qm", "two"]);
+            let second = git_in(&root, &["rev-parse", "HEAD"]);
+            fx.git(&["pack-refs", "--all", "--prune"]);
+            set_modified(if keep_time { original_time } else { original_time - std::time::Duration::from_secs(60) });
+            assert_ne!(std::fs::metadata(&packed).unwrap().len(), original_len);
+            let branch = if linked { "agent/check" } else { "master" };
+            assert!(!fx.path(&format!(".git/refs/heads/{branch}")).exists());
+            for revision in ["HEAD", "@", branch] {
+                let q = LogQuery { branches: vec![revision.into()], ..query.clone() };
+                let rows = repo.log(&q).unwrap_or_else(|error| {
+                    panic!("linked={linked}, keep_time={keep_time}, revision={revision}: {error}")
+                });
+                assert_eq!(rows[0].id, second);
+            }
+            assert_eq!(repo.head().unwrap().1.as_deref(), Some(second.as_str()));
+            assert_eq!(
+                repo.file_at(Path::new("file.txt"), Some("HEAD"), encoding_rs::UTF_8).unwrap().as_deref(),
+                Some("two\n")
+            );
+        }
+    }
+}
+
+#[test]
 fn status_reflects_external_changes_without_reopen() {
     let fx = Fixture::new();
     fx.write("a", "1\n");
@@ -1219,6 +1429,30 @@ fn status_reflects_external_changes_without_reopen() {
     assert!(repo.status().unwrap().is_empty());
     fx.git(&["checkout", "-q", "-b", "x"]);
     assert_eq!(repo.branch_info().unwrap().head.as_deref(), Some("x"));
+}
+
+#[test]
+fn branches_in_newly_written_packs_stay_visible() {
+    let fx = Fixture::new();
+    fx.write("a", "1\n");
+    fx.commit_all("a");
+    let repo = fx.repo();
+    assert_eq!(repo.branches().unwrap().len(), 1);
+
+    // An external pull: objects move into a pack the IDE has never seen, then a
+    // new branch points at a commit living only in that pack.
+    fx.write("a", "2\n");
+    fx.commit_all("b");
+    fx.git(&["repack", "-adq"]);
+    fx.git(&["checkout", "-q", "-b", "uat"]);
+    let uat = fx.git(&["rev-parse", "uat"]);
+    assert!(std::fs::read_dir(fx.path(".git/objects/pack")).unwrap().count() >= 2);
+
+    let names: Vec<String> = repo.branches().unwrap().into_iter().map(|b| b.name).collect();
+    assert!(names.contains(&"uat".to_string()), "branches: {names:?}, want uat at {uat}");
+
+    // Status peels HEAD for the tree-index diff: the same failure drops it too.
+    assert!(repo.status().is_ok(), "status failed: {:?}", repo.status().unwrap_err());
 }
 
 #[test]
@@ -1357,7 +1591,7 @@ fn encoded_java_hunks_staging_blame_and_partial_commit_preserve_bytes() {
             let repo = fx.repo();
             assert_eq!(repo.file_at(&path, None, encoding).unwrap().as_deref(), Some(old.as_str()));
             assert!(
-                repo.blame(&path, Some(&old.replace("\r\n", "\n")), encoding)
+                repo.blame(&path, Some(&old.replace("\r\n", "\n")), None, encoding)
                     .unwrap()
                     .iter()
                     .all(|line| line.author == "Test User")
@@ -1482,4 +1716,233 @@ fn gbk_text_patch_keeps_utf8_paths_and_encoded_payload() {
     let patch = build_partial_patch("中文.java", new, "// 😀\n", &[0]);
     assert!(repo.stage_patch(&patch, &|_| Ok(encoding_rs::GBK)).is_err());
     assert_eq!(repo.file_bytes_at(&path, Some(":0")).unwrap().unwrap(), encoding_rs::GBK.encode(new).0.as_ref());
+}
+
+#[cfg(unix)]
+#[test]
+fn restricted_reads_ignore_executable_repository_configuration() {
+    let f = Fixture::new();
+    f.write("a.txt", "one\ntwo\n");
+    f.commit_all("initial");
+    f.write(".gitattributes", "*.txt filter=evil diff=evil\n");
+    f.write("a.txt", "one\nchanged\n");
+    for key in ["filter.evil.clean", "diff.evil.textconv", "diff.external", "core.fsmonitor"] {
+        f.git(&["config", key, "touch execution.marker; cat"]);
+    }
+    let repo = f.repo();
+    repo.set_execution_allowed(false);
+    assert!(!repo.status().unwrap().is_empty());
+    assert!(repo.diff_text(&f.path("a.txt"), false, encoding_rs::UTF_8).unwrap().contains("changed"));
+    assert_eq!(repo.blame(&f.path("a.txt"), None, None, encoding_rs::UTF_8).unwrap().len(), 2);
+    assert!(!repo.diff_with_worktree("HEAD").unwrap().is_empty());
+    assert!(!repo.log(&LogQuery::default()).unwrap().is_empty());
+    repo.merge_versions(&f.path("a.txt"), encoding_rs::UTF_8).unwrap();
+    assert!(!f.path("execution.marker").exists());
+    let repos = ide_vcs::Repos::discover(&f.dir, &|_| false).unwrap();
+    for r in repos.all() {
+        r.set_execution_allowed(false);
+    }
+    let compared =
+        repos.compare_paths(std::slice::from_ref(&f.dir), "HEAD", None, &ide_core::CancellationToken::new()).unwrap();
+    assert!(compared.repositories.iter().all(|r| r.error.is_none()));
+    assert!(!f.path("execution.marker").exists());
+    // Positive control: the same filter really executes without restriction.
+    f.git(&["-c", "core.fsmonitor=false", "diff", "--no-ext-diff", "--no-textconv"]);
+    assert!(f.path("execution.marker").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn restricted_conflict_preview_uses_host_owned_temporary_files() {
+    let f = Fixture::new();
+    f.write("a.txt", "base\n");
+    f.commit_all("base");
+    f.git(&["checkout", "-b", "other"]);
+    f.write("a.txt", "other\n");
+    f.commit_all("other");
+    f.git(&["checkout", "main"]);
+    f.write("a.txt", "mine\n");
+    f.commit_all("mine");
+    let output = Command::new("git").current_dir(&f.dir).args(["merge", "other"]).output().unwrap();
+    assert!(!output.status.success());
+    let trap = f.path(&format!(".git/openidea-merge-{}", std::process::id()));
+    std::fs::create_dir_all(&trap).unwrap();
+    let marker = f._tmp.path().join("user-data");
+    std::fs::write(&marker, "untouched").unwrap();
+    std::os::unix::fs::symlink(&marker, trap.join("ours")).unwrap();
+    let repo = f.repo();
+    repo.set_execution_allowed(false);
+    let versions = repo.merge_versions(&f.path("a.txt"), encoding_rs::UTF_8).unwrap();
+    assert!(versions.merged.unwrap().contains("<<<<<<<"));
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "untouched");
+}
+
+#[test]
+fn commit_leaves_excluded_staged_changes_staged() {
+    let fx = Fixture::new();
+    fx.write("a.txt", "a\n");
+    fx.write("b.txt", "b\n");
+    fx.write("old.txt", "renamed\n");
+    fx.commit_all("base");
+    let repo = fx.repo();
+
+    // a.txt: staged and edited again; b.txt: staged; new.txt: staged addition; old.txt: staged rename.
+    fx.write("a.txt", "a staged\n");
+    fx.write("b.txt", "b staged\n");
+    fx.write("new.txt", "new\n");
+    fx.git(&["add", "a.txt", "b.txt", "new.txt"]);
+    fx.git(&["mv", "old.txt", "moved.txt"]);
+    fx.write("a.txt", "a on disk\n");
+
+    // Commit a.txt as it is on disk; leave out b.txt, new.txt and the rename.
+    let options = CommitOptions {
+        stage: vec![fx.path("a.txt").into()],
+        exclude: vec![
+            fx.path("b.txt").into(),
+            fx.path("new.txt").into(),
+            fx.path("moved.txt").into(),
+            fx.path("old.txt").into(),
+        ],
+        ..Default::default()
+    };
+    repo.commit_with("only a", &options, &|_| Ok(encoding_rs::UTF_8)).unwrap();
+
+    assert_eq!(fx.git(&["show", "--name-only", "--format=", "HEAD"]), "a.txt");
+    assert_eq!(fx.git(&["show", "HEAD:a.txt"]), "a on disk");
+    // What was left out is still staged, exactly as before.
+    let mut staged: Vec<String> =
+        fx.git(&["diff", "--cached", "--name-status", "-M"]).lines().map(str::to_string).collect();
+    staged.sort();
+    assert_eq!(staged, ["A\tnew.txt", "M\tb.txt", "R100\told.txt\tmoved.txt"]);
+    assert_eq!(fx.git(&["show", ":b.txt"]), "b staged");
+    assert_eq!(fx.git(&["diff", "--name-only"]), "", "nothing unstaged is left behind");
+    assert!(!fx.dir.join(".git/openidea-partial-index").exists());
+}
+
+#[test]
+fn commit_of_staged_version_keeps_the_unstaged_rest() {
+    let fx = Fixture::new();
+    fx.write("a.txt", "1\n");
+    fx.write("b.txt", "1\n");
+    fx.commit_all("base");
+    let repo = fx.repo();
+    fx.write("a.txt", "2\n");
+    fx.write("b.txt", "2\n");
+    fx.git(&["add", "a.txt", "b.txt"]);
+    fx.write("a.txt", "3\n");
+
+    // a.txt committed as staged (its unstaged edit stays), b.txt left out.
+    let options = CommitOptions { exclude: vec![fx.path("b.txt").into()], ..Default::default() };
+    repo.commit_with("staged a", &options, &|_| Ok(encoding_rs::UTF_8)).unwrap();
+
+    assert_eq!(fx.git(&["show", "HEAD:a.txt"]), "2");
+    assert_eq!(fx.git(&["show", "HEAD:b.txt"]), "1");
+    assert_eq!(fx.git(&["diff", "--cached", "--name-only"]), "b.txt");
+    assert_eq!(fx.git(&["diff", "--name-only"]), "a.txt");
+    assert_eq!(fx.read("a.txt"), "3\n");
+}
+
+#[test]
+fn commit_with_exclusions_in_a_repository_without_commits() {
+    let fx = Fixture::new();
+    fx.write("a.txt", "a\n");
+    fx.write("b.txt", "b\n");
+    fx.git(&["add", "-A"]);
+    let repo = fx.repo();
+    let options = CommitOptions { exclude: vec![fx.path("b.txt").into()], ..Default::default() };
+    repo.commit_with("first", &options, &|_| Ok(encoding_rs::UTF_8)).unwrap();
+    assert_eq!(fx.git(&["show", "--name-only", "--format=", "HEAD"]), "a.txt");
+    assert_eq!(fx.git(&["diff", "--cached", "--name-status"]), "A\tb.txt");
+}
+
+#[test]
+fn smart_checkout_keeps_staged_changes_staged() {
+    let fx = Fixture::new();
+    fx.write("f.txt", "1\n2\n3\n4\n5\n");
+    fx.write("s.txt", "s\n");
+    fx.commit_all("base");
+    fx.git(&["checkout", "-q", "-b", "other"]);
+    fx.write("f.txt", "1\nother\n3\n4\n5\n");
+    fx.commit_all("other edit");
+    fx.git(&["checkout", "-q", "main"]);
+    let repo = fx.repo();
+
+    fx.write("f.txt", "1\n2\n3\n4\nlocal\n");
+    fx.write("s.txt", "staged\n");
+    fx.git(&["add", "s.txt"]);
+    let opts = CheckoutOptions { mode: CheckoutMode::Smart, diverged: None };
+    assert_eq!(repo.checkout_with("other", false, &opts).unwrap(), CheckoutOutcome::Done);
+    assert_eq!(repo.branch_info().unwrap().head.as_deref(), Some("other"));
+    assert_eq!(fx.read("f.txt"), "1\nother\n3\n4\nlocal\n");
+    assert_eq!(fx.git(&["diff", "--cached", "--name-only"]), "s.txt", "staged change stays staged");
+    assert_eq!(fx.git(&["diff", "--name-only"]), "f.txt");
+    assert!(repo.stashes().unwrap().is_empty());
+}
+
+#[test]
+fn checkout_reports_untracked_files_it_would_overwrite() {
+    let fx = Fixture::new();
+    fx.write("f.txt", "f\n");
+    fx.commit_all("base");
+    fx.git(&["checkout", "-q", "-b", "other"]);
+    fx.write("dir/new.txt", "theirs\n");
+    fx.commit_all("add new");
+    fx.git(&["checkout", "-q", "main"]);
+    fx.write("dir/new.txt", "mine\n");
+    let repo = fx.repo();
+    for mode in [CheckoutMode::Normal, CheckoutMode::Smart] {
+        let opts = CheckoutOptions { mode, diverged: None };
+        let outcome = repo.checkout_with("other", false, &opts).unwrap();
+        assert_eq!(outcome, CheckoutOutcome::UntrackedFiles { files: vec!["dir/new.txt".into()] });
+        assert_eq!(repo.branch_info().unwrap().head.as_deref(), Some("main"));
+        assert_eq!(fx.read("dir/new.txt"), "mine\n");
+    }
+}
+
+#[test]
+fn reword_keeps_local_changes_and_can_be_undone() {
+    let fx = Fixture::new();
+    fx.write("a.txt", "1\n");
+    let first = fx.commit_all("first");
+    fx.write("a.txt", "2\n");
+    let second = fx.commit_all("second");
+    fx.write("b.txt", "b\n");
+    fx.commit_all("third");
+    // Local changes, staged and not, must survive untouched.
+    fx.write("a.txt", "local\n");
+    fx.write("staged.txt", "s\n");
+    fx.git(&["add", "staged.txt"]);
+    let repo = fx.repo();
+
+    let change = repo.reword(&second, "second, reworded\n\nwith a body").unwrap();
+    assert_eq!(fx.git(&["log", "--format=%s", "-3"]), "third\nsecond, reworded\nfirst");
+    assert_eq!(fx.git(&["log", "-1", "--format=%B", "HEAD~1"]), "second, reworded\n\nwith a body");
+    assert_eq!(fx.git(&["rev-parse", "HEAD~2"]), first, "commits before it keep their ids");
+    assert_eq!(fx.git(&["rev-parse", "HEAD"]), change.after);
+    assert_eq!(fx.git(&["symbolic-ref", "--short", "HEAD"]), "main", "the branch moved, not a detached HEAD");
+    assert_eq!(fx.read("a.txt"), "local\n");
+    assert_eq!(fx.git(&["diff", "--cached", "--name-only"]), "staged.txt");
+    assert_eq!(fx.git(&["diff", "--name-only"]), "a.txt");
+
+    repo.restore_head(&change.before, &change.after).unwrap();
+    assert_eq!(fx.git(&["log", "--format=%s", "-3"]), "third\nsecond\nfirst");
+    assert_eq!(fx.read("a.txt"), "local\n");
+    assert_eq!(fx.git(&["diff", "--cached", "--name-only"]), "staged.txt");
+
+    // Undo is refused once HEAD has moved.
+    let change = repo.reword("HEAD", "third, reworded").unwrap();
+    fx.git(&["commit", "-q", "--allow-empty", "-m", "later"]);
+    assert!(repo.restore_head(&change.before, &change.after).is_err());
+}
+
+#[test]
+fn reword_refuses_commits_outside_the_current_branch() {
+    let fx = Fixture::new();
+    fx.write("a.txt", "1\n");
+    fx.commit_all("first");
+    fx.git(&["checkout", "-q", "-b", "side"]);
+    fx.write("a.txt", "side\n");
+    let side = fx.commit_all("side");
+    fx.git(&["checkout", "-q", "main"]);
+    assert!(fx.repo().reword(&side, "other").is_err());
 }

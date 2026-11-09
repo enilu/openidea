@@ -3,7 +3,16 @@
  * window-deactivation dismissal (top-most popup only for Escape), optional
  * focus trap and focus restore.
  */
-import { useEffect, useLayoutEffect, useMemo, useRef, type CSSProperties, type ReactNode, type RefObject } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+  type RefObject,
+} from "react";
 import { createPortal } from "react-dom";
 import clsx from "clsx";
 import {
@@ -87,9 +96,11 @@ function PopupInner({
       shift({ padding: 6 }),
       sizeMw({
         padding: 6,
-        apply({ rects, elements, availableHeight }) {
+        apply({ rects, elements, availableHeight, availableWidth }) {
           elements.floating.style.maxHeight = `${Math.max(120, availableHeight)}px`;
-          if (matchWidth) elements.floating.style.minWidth = `${rects.reference.width}px`;
+          const width = Math.max(0, availableWidth);
+          elements.floating.style.maxWidth = `${width}px`;
+          if (matchWidth) elements.floating.style.minWidth = `${Math.min(rects.reference.width, width)}px`;
         },
       }),
     ],
@@ -108,10 +119,11 @@ function PopupInner({
   useLayoutEffect(() => {
     onCloseRef.current = onClose;
   });
+  // Read while rendering: content such as a menu focuses itself before any effect here runs.
+  const [previous] = useState(() => document.activeElement as HTMLElement | null);
 
   useEffect(() => {
     const layer = openLayer(() => elRef.current);
-    const previous = document.activeElement as HTMLElement | null;
 
     const onKey = (e: KeyboardEvent) => {
       if (!layer.isTop()) return;

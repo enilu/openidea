@@ -5,9 +5,10 @@
  * and symbol, and at most a few reference requests in flight. Beside each
  * count, the declaration's last author from VCS blame (`authorLens`).
  */
+import { Channel } from "@tauri-apps/api/core";
 import { EditorSelection, MapMode, StateEffect, StateField, type Extension, type Text } from "@codemirror/state";
 import { EditorView, ViewPlugin, type ViewUpdate } from "@codemirror/view";
-import { codeLenses, type CodeLens } from "@/editor/api";
+import { codeLenses, shownAgain, type CodeLens } from "@/editor/api";
 import { executeAction } from "@/platform/actions";
 import { commands, nextRequestId, type OutlineItem, type RequestId, type SymbolKind } from "@/platform/ipc";
 import { useProject } from "@/platform/project";
@@ -118,6 +119,7 @@ class UsagesLensPlugin {
   private offReady: () => void;
   private offSettled: () => void;
   private offBlame: () => void;
+  private skipped = false;
 
   constructor(private view: EditorView) {
     this.refresh();
@@ -136,7 +138,7 @@ class UsagesLensPlugin {
   }
 
   update(u: ViewUpdate) {
-    if (u.docChanged || u.viewportChanged) this.refresh();
+    if (u.docChanged || u.viewportChanged || (this.skipped && shownAgain(u))) this.refresh();
   }
 
   private cancel() {
@@ -152,7 +154,8 @@ class UsagesLensPlugin {
 
   private async run() {
     const view = this.view;
-    if (!view.dom.isConnected) return;
+    this.skipped = !view.dom.isConnected;
+    if (this.skipped) return;
     const doc = docOf(view);
     if (!doc) return;
     const gen = this.generation;
@@ -195,7 +198,15 @@ class UsagesLensPlugin {
                 this.pending.add(request);
                 // Opening candidate files for each count triggers expensive server analysis.
                 // Only an explicit Find Usages should widen the server's scope.
-                return commands.lspReferences(request, doc.doc, { line: t.line, col: t.col }, false, false);
+                return commands.lspReferences(
+                  request,
+                  doc.doc,
+                  { line: t.line, col: t.col },
+                  false,
+                  false,
+                  false,
+                  new Channel(),
+                );
               }, wanted);
               if (wanted()) {
                 if (incomplete) this.incomplete = true;

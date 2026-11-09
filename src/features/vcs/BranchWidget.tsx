@@ -1,6 +1,6 @@
 import { branchesByRepo } from "./multiRoot";
 /** Title bar branch widget (branch name + incoming / outgoing markers) + Branches popup. */
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type RefObject } from "react";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import clsx from "clsx";
 import { create } from "zustand";
 import type { Branch, BranchInfo } from "@/bindings";
@@ -23,7 +23,9 @@ import {
   type MenuItem,
   T,
 } from "@/ui";
+import type { PopupAnchor } from "@/ui/Popup";
 import { buildBranchRows, withExpanded, type BranchRow, type PopupAction } from "./branches";
+import { branchPresentation, extensionPopupActions, useBranchWidgetExtensions } from "./branchWidgetExtensions";
 import { branchMenu, commonBranchMenu, inRepo, tagMenu } from "./branchMenu";
 import { loadFavoriteBranches, recentBranches, toggleFavoriteBranch, useFavoriteBranches } from "./branchOps";
 import { inProgress, operationTitle, type InProgress } from "./operations";
@@ -36,6 +38,7 @@ import {
   type RepoRow,
 } from "./repoBranches";
 import { currentRepo, focusRepo, loadBranches, repoName, useVcs } from "./store";
+import { BranchSync } from "./BranchSync";
 import styles from "./BranchWidget.module.css";
 import { tx } from "@/platform/i18n";
 
@@ -65,8 +68,10 @@ export function BranchWidget() {
   const other = useVcs((s) => (diverged && current && current !== s.repo ? (s.heads[current] ?? null) : null));
   const otherOp = useVcs((s) => (current ? (s.operations[current] ?? null) : null));
   const open = useBranchesPopup((s) => s.open);
-  const ref = useRef<HTMLButtonElement>(null);
+  const extensions = useBranchWidgetExtensions((s) => s.extensions);
   if (!available || !selected) return null;
+  // Another feature presents the current branch (the GitHub pull request on it).
+  const presented = other ? null : branchPresentation(extensions);
   const repo = diverged && current ? repoName(current) : null;
   const branch: BranchInfo = other
     ? { head: other.head, headCommit: other.headCommit, upstream: null, ahead: 0, behind: 0, operation: otherOp }
@@ -81,6 +86,7 @@ export function BranchWidget() {
           ? tx`${branch.ahead} outgoing commits`
           : "";
   const tooltip = [
+    presented?.tooltip ?? "",
     repo ? tx`Repository: ${repo}` : "",
     tx`Git branch: ${head}`,
     branch.upstream ? tx`Tracking ${branch.upstream}` : "",
@@ -92,7 +98,7 @@ export function BranchWidget() {
   return (
     <>
       <BarButton
-        ref={ref}
+        data-branches-widget
         variant="title"
         className={styles.widget}
         tooltip={tooltip}
@@ -100,28 +106,29 @@ export function BranchWidget() {
         aria-expanded={open}
         onClick={() => useBranchesPopup.setState({ open: !open })}
       >
-        <Icon name={branch.head ? "branch" : "commit"} size={16} className={styles.icon} />
+        <Icon name={presented?.icon ?? (branch.head ? "branch" : "commit")} size={16} className={styles.icon} />
         {repo && <span className={styles.repo}>{repo}</span>}
         <span className={styles.name}>
           {inProgress(branch.operation)
             ? operationTitle(inProgress(branch.operation)!, branch.head)
-            : headLabel(branch)}
+            : (presented?.text ?? headLabel(branch))}
         </span>
         {branch.operation && !inProgress(branch.operation) && (
           <span className={styles.operation}>{branch.operation}</span>
         )}
         {/* Like IDEA's widget: icons only; counts are in the tooltip. */}
-        {branch.behind > 0 && (
-          <Icon name="vcs-incoming" size={12} className={clsx(styles.sync, styles.incoming)} label="Incoming commits" />
-        )}
-        {branch.ahead > 0 && (
-          <Icon name="vcs-outgoing" size={12} className={clsx(styles.sync, styles.outgoing)} label="Outgoing commits" />
-        )}
+        <BranchSync behind={branch.behind} ahead={branch.ahead} showCounts={false} />
         <Icon name="chevron-down" size={14} className={styles.chevron} />
       </BarButton>
-      {open && <BranchesPopup anchor={ref} onClose={() => useBranchesPopup.setState({ open: false })} />}
     </>
   );
+}
+
+export function BranchesPopupHost() {
+  const open = useBranchesPopup((s) => s.open);
+  if (!open) return null;
+  const anchor = document.querySelector("[data-branches-widget]") ?? { x: window.innerWidth / 2 - 160, y: 60 };
+  return <BranchesPopup anchor={anchor} onClose={() => useBranchesPopup.setState({ open: false })} />;
 }
 
 const POPUP_ACTIONS: PopupAction[] = [
@@ -227,9 +234,11 @@ function OptionsButton({ hasTags }: { hasTags: boolean }) {
 
 /** Entries IDEA puts at the top of the Branches popup while an operation is stopped. */
 export function operationActions(op: InProgress | null, conflicts: number): PopupAction[] {
-  if (!op) return [];
   const out: PopupAction[] = [];
+  // Conflicts are resolved whether or not an operation is stopped: applying a stash, or the
+  // autostash of a pull, leaves them with none in progress.
   if (conflicts) out.push({ id: "vcs.resolveConflicts", label: "Resolve Conflicts…", icon: "warning" });
+  if (!op) return out;
   const ids: Record<InProgress, Array<[string, string]>> = {
     rebase: [
       ["vcs.rebase.continue", "Continue Rebase"],
@@ -280,8 +289,10 @@ const caretAt = (e: KeyboardEvent, where: "start" | "end") => {
   return where === "end" ? input.selectionStart === input.value.length : input.selectionStart === 0;
 };
 
-function BranchesPopup({ anchor, onClose }: { anchor: RefObject<HTMLElement | null>; onClose: () => void }) {
+function BranchesPopup({ anchor, onClose }: { anchor: PopupAnchor; onClose: () => void }) {
   const multi = useVcs((s) => s.roots.length > 1);
+  const extensions = useBranchWidgetExtensions((s) => s.extensions);
+  const actions = useMemo(() => [...POPUP_ACTIONS, ...extensionPopupActions(extensions)], [extensions]);
   // ⌥⌘N is also Inline (enabled while a popup is open over an editor): the search field handles it here.
   useEffect(() => registerKeyClaim((_e, stroke) => isNewBranchStroke(stroke)), []);
   return (
@@ -293,7 +304,11 @@ function BranchesPopup({ anchor, onClose }: { anchor: RefObject<HTMLElement | nu
       aria-label="Git Branches"
       className={clsx(styles.popup, multi && styles.wide)}
     >
-      {multi ? <MultiRepoPanel onClose={onClose} /> : <BranchesPanel onClose={onClose} actions={POPUP_ACTIONS} />}
+      {multi ? (
+        <MultiRepoPanel onClose={onClose} actions={actions} />
+      ) : (
+        <BranchesPanel onClose={onClose} actions={actions} />
+      )}
     </Popup>
   );
 }
@@ -506,7 +521,7 @@ function SubMenu({
  * each opening its own branches (on hover or →); then the branches they all have
  * (acting on all of them) or, when their branches differ, the current repository's.
  */
-function MultiRepoPanel({ onClose }: { onClose: () => void }) {
+function MultiRepoPanel({ onClose, actions: popupActions }: { onClose: () => void; actions: readonly PopupAction[] }) {
   const roots = useVcs((s) => s.roots);
   const heads = useVcs((s) => s.heads);
   const operations = useVcs((s) => s.operations);
@@ -568,9 +583,9 @@ function MultiRepoPanel({ onClose }: { onClose: () => void }) {
   const actions = useMemo(
     () => [
       ...operationActions(op, conflicts),
-      ...POPUP_ACTIONS.map((a) => (a.id === "vcs.newBranch" ? { ...a, arg: { repos: roots } } : a)),
+      ...popupActions.map((a) => (a.id === "vcs.newBranch" ? { ...a, arg: { repos: roots } } : a)),
     ],
-    [op, conflicts, roots],
+    [op, conflicts, roots, popupActions],
   );
   const rows = useMemo(
     () =>
@@ -822,7 +837,15 @@ function BranchRowView({ row }: { row: BranchRow | Extract<RepoRow, { type: "act
     const keys = shortcutLabel(row.action.id);
     return (
       <span className={styles.row} data-row-key={row.key}>
-        <Icon name={row.action.icon ?? "more"} size={14} className={styles.rowIcon} />
+        {row.action.checked === false ? (
+          <span className={styles.rowIcon} style={{ width: 14 }} />
+        ) : (
+          <Icon
+            name={row.action.checked ? "check" : (row.action.icon ?? "more")}
+            size={14}
+            className={styles.rowIcon}
+          />
+        )}
         <HighlightedText className={styles.label} text={tx(row.action.label)} indices={row.matches} tone="accent" />
         {keys && <span className={styles.keys}>{keys}</span>}
       </span>
@@ -877,19 +900,7 @@ function BranchRowView({ row }: { row: BranchRow | Extract<RepoRow, { type: "act
           <T>current</T>
         </span>
       )}
-      {/* Like IDEA: incoming (↙) before outgoing (↗). */}
-      {b.behind > 0 && (
-        <span className={clsx(styles.syncSmall, styles.incoming)} title={tx`${b.behind} incoming commits`}>
-          <Icon name="vcs-incoming" size={12} />
-          {b.behind}
-        </span>
-      )}
-      {b.ahead > 0 && (
-        <span className={clsx(styles.syncSmall, styles.outgoing)} title={tx`${b.ahead} outgoing commits`}>
-          <Icon name="vcs-outgoing" size={12} />
-          {b.ahead}
-        </span>
-      )}
+      <BranchSync behind={b.behind} ahead={b.ahead} />
       {!b.remote && b.upstream && <span className={styles.upstream}>{b.upstream}</span>}
       <Icon name="chevron-right" size={10} className={styles.chevron} />
     </span>

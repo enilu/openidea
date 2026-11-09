@@ -22,6 +22,10 @@ use std::time::Duration;
 
 type Changes = Vec<(OsString, Option<OsString>)>;
 
+/// Set by the desktop when the Dev Containers CLI already ran the lifecycle commands
+/// (`devcontainer up`): the server then doesn't run `postStartCommand` again.
+pub const LIFECYCLE_DONE_ENV: &str = "OPENIDEA_LIFECYCLE_DONE";
+
 /// What Reload Environment changed.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
@@ -44,6 +48,7 @@ struct State {
     project: Changes,
     /// Project roots whose `postStartCommand` ran in this process.
     post_started: HashSet<PathBuf>,
+    post_commands: std::collections::HashMap<PathBuf, CancellationToken>,
 }
 
 pub struct Environment {
@@ -71,14 +76,19 @@ impl Environment {
             return None;
         }
         let config = self.load_project(root, sink);
-        let post_start = config.and_then(|c| c.post_start);
+        let post_start = config.and_then(|c| c.post_start).filter(|_| std::env::var_os(LIFECYCLE_DONE_ENV).is_none());
         let first = self.state.lock().post_started.insert(root.to_path_buf());
         post_start.filter(|_| first)
     }
 
     pub(crate) fn project_closed(&self) {
         if self.project_env {
-            self.state.lock().project.clear();
+            let mut state = self.state.lock();
+            for (_, token) in state.post_commands.drain() {
+                token.cancel();
+            }
+            state.project.clear();
+            drop(state);
             self.publish();
         }
     }
@@ -144,6 +154,7 @@ impl Environment {
     /// a failure is a notification.
     pub(crate) fn spawn_post_start(&self, cmd: LifecycleCommand, root: PathBuf, sink: SharedSink) {
         let cancel = self.cancel.child_token();
+        self.state.lock().post_commands.insert(root.clone(), cancel.clone());
         let spawned = std::thread::Builder::new().name("openidea-post-start".into()).spawn(move || {
             run_post_start(&cmd, &root, &sink, &cancel);
         });
@@ -263,6 +274,9 @@ fn run_post_start(cmd: &LifecycleCommand, root: &Path, sink: &SharedSink, cancel
 /// Runs `argv` in `root` with the children's environment, its stdout and stderr line by line
 /// to `on_line`; `Err` says how it failed.
 fn run_one(argv: &[String], root: &Path, cancel: &CancellationToken, on_line: &dyn Fn(String)) -> Result<(), String> {
+    if cancel.is_cancelled() {
+        return Err("cancelled".into());
+    }
     let (program, args) = argv.split_first().ok_or("empty command")?;
     let mut child = ide_core::process::prepare(&mut Command::new(program))
         .args(args)

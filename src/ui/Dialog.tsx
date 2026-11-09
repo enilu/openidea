@@ -5,8 +5,9 @@ import { usePlatform } from "@/platform/platformInfo";
 import { Button, IconButton } from "./Button";
 import { Icon } from "./icons";
 import { FOCUSABLE, onWindowDeactivate, openLayer, trapTab } from "./popupState";
-import { useTx } from "@/platform/i18n";
+import { tx, useGivenTx } from "@/platform/i18n";
 import { selectableText } from "./selectableText";
+import appIcon from "../../src-tauri/icons/128x128.png";
 import styles from "./Dialog.module.css";
 import { isImeKey } from "@/platform/ime";
 
@@ -73,7 +74,7 @@ export function DialogButtons({
   platform?: DialogPlatform;
 }) {
   const platform = useDialogPlatform(override);
-  const tx = useTx();
+  const given = useGivenTx();
   return (
     <div className={styles.buttons}>
       {orderDialogButtons(buttons, platform).map((b) => (
@@ -81,12 +82,12 @@ export function DialogButtons({
           key={b.label}
           variant={b.role === "default" ? "primary" : "secondary"}
           disabled={b.disabled}
-          title={tx(b.title)}
+          title={given(b.title)}
           data-autofocus={b.autoFocus ? "" : undefined}
           data-dialog-default={b.role === "default" ? "" : undefined}
           onClick={b.onClick ?? (b.role === "cancel" ? onCancel : undefined)}
         >
-          {tx(b.label)}
+          {given(b.label)}
         </Button>
       ))}
     </div>
@@ -109,9 +110,23 @@ export interface DialogProps {
   footer?: ReactNode;
   width?: number | string;
   /**
+   * `both` shows a corner grip resizing the window or popup. The content lays out
+   * again against the new size; a numeric `width` is also the minimum width
+   * unless `minWidth` says otherwise.
+   */
+  resizable?: "both";
+  minWidth?: number;
+  minHeight?: number;
+  /** Height cap while content-sized; a manual resize lifts it. */
+  maxHeight?: number;
+  /** Size to open at, such as one remembered from `onResized`; kept inside the window. */
+  initialSize?: { w: number; h: number } | null;
+  /** The size a resize ended at. */
+  onResized?: (size: { w: number; h: number }) => void;
+  /**
    * `top` places a lightweight modal popup (choosers, Search Everywhere) near
    * the top. Popups (also any dialog without a title) get no window title bar
-   * and are not draggable.
+   * and drag only by a `[data-dialog-drag]` element, such as their title.
    */
   position?: "center" | "top";
   className?: string;
@@ -120,6 +135,11 @@ export interface DialogProps {
   dismissOnBackdrop?: boolean;
   /** Close when the app window loses focus (default: popups only; never modal dialogs). */
   closeOnDeactivate?: boolean;
+  /**
+   * Asked on close: give focus back to what had it before the dialog (default: always). False
+   * when what the dialog opens takes focus itself.
+   */
+  restoreFocus?: () => boolean;
   /** @deprecated Dialogs never dim the window behind them; kept for call sites. */
   transparentBackdrop?: boolean;
   /** @deprecated Every centred dialog has window chrome; kept for call sites. */
@@ -130,7 +150,7 @@ export interface DialogProps {
    * A Messages alert (IDEA `MessageDialogBuilder`): no title bar, this icon on the
    * left, the title in bold above the content, `footerStart` under the text.
    */
-  icon?: MessageIconKind;
+  icon?: MessageIconKind | "app";
 }
 
 export type MessageIconKind = "question" | "info" | "warning" | "error";
@@ -194,29 +214,43 @@ function DialogInner({
   onHelp,
   footer,
   width = 480,
+  resizable,
+  minWidth,
+  minHeight,
+  maxHeight,
+  initialSize,
+  onResized,
   position = "center",
   className,
   dismissOnBackdrop,
   closeOnDeactivate,
+  restoreFocus,
   platform: platformOverride,
   icon,
   ...aria
 }: DialogProps) {
   const ref = useRef<HTMLDivElement>(null);
   const platform = useDialogPlatform(platformOverride);
-  const tx = useTx();
-  if (typeof title === "string") title = tx(title);
+  const given = useGivenTx();
+  if (typeof title === "string") title = given(title);
   // Choosers and untitled dialogs (Recent Files, About) are IDEA popups.
   const popup = position === "top" || (title == null && !icon);
   const onCloseRef = useRef(onClose);
   const buttonsRef = useRef(buttons);
+  const restoreFocusRef = useRef(restoreFocus);
   useLayoutEffect(() => {
     onCloseRef.current = onClose;
     buttonsRef.current = buttons;
+    restoreFocusRef.current = restoreFocus;
   });
 
   const [offset, setOffset] = useState({ x: 0, y: 0 });
   const [active, setActive] = useState(() => typeof document === "undefined" || document.hasFocus());
+  const [size, setSize] = useState<{ w: number; h: number } | null>(() =>
+    resizable && initialSize && typeof window !== "undefined"
+      ? { w: Math.min(initialSize.w, window.innerWidth - 24), h: Math.min(initialSize.h, window.innerHeight - 24) }
+      : null,
+  );
 
   useEffect(() => {
     const onFocus = () => setActive(true);
@@ -273,14 +307,14 @@ function DialogInner({
     return () => {
       document.removeEventListener("keydown", onKey);
       layer.release();
-      if (previous?.isConnected) previous.focus({ preventScroll: true });
+      if (previous?.isConnected && restoreFocusRef.current?.() !== false) previous.focus({ preventScroll: true });
     };
   }, []);
 
   const drag = (e: PointerEvent<HTMLDivElement>) => {
     if (
-      popup ||
       e.button !== 0 ||
+      !(e.target as Element).closest("[data-dialog-drag]") ||
       (e.target as Element).closest(`button, input, label, a, select, textarea, .${selectableText}`)
     )
       return;
@@ -291,6 +325,7 @@ function DialogInner({
     const rect = el.getBoundingClientRect();
     const base = { left: rect.left - offset.x, top: rect.top - offset.y };
     const move = (ev: globalThis.PointerEvent) => {
+      if (!(ev.buttons & 1)) return up();
       // Keep the title bar reachable.
       const x = Math.min(
         Math.max(ev.clientX - start.x, -base.left - rect.width + 80),
@@ -309,6 +344,43 @@ function DialogInner({
 
   const label = aria["aria-label"] ?? (typeof title === "string" ? title : undefined);
   const hasFooter = !!(buttons?.length || footerStart || onHelp || footer);
+  const canResize = resizable === "both";
+
+  const resize = (e: PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    const el = ref.current;
+    if (!el) return;
+    e.preventDefault();
+    const start = { x: e.clientX, y: e.clientY };
+    const rect = el.getBoundingClientRect();
+    const minW = minWidth ?? (typeof width === "number" ? width : 320);
+    const chrome = el.querySelector<HTMLElement>("[data-dialog-titlebar]")?.offsetHeight ?? 0;
+    const minH = minHeight ?? chrome + 120;
+    const origin = offset;
+    let last: { w: number; h: number } | null = null;
+    const move = (ev: globalThis.PointerEvent) => {
+      if (!(ev.buttons & 1)) return up();
+      const w = Math.min(Math.max(rect.width + ev.clientX - start.x, minW), window.innerWidth - 24);
+      // A `top` popup grows downwards from where it sits.
+      const maxH = position === "top" ? window.innerHeight - rect.top - 12 : window.innerHeight - 24;
+      const h = Math.min(Math.max(rect.height + ev.clientY - start.y, minH), maxH);
+      last = { w, h };
+      setSize(last);
+      // The overlay centres the dialog (a `top` popup only horizontally): shift by half
+      // the growth so its top-left stays put.
+      setOffset({
+        x: origin.x + (w - rect.width) / 2,
+        y: position === "top" ? origin.y : origin.y + (h - rect.height) / 2,
+      });
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      if (last) onResized?.(last);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
 
   return createPortal(
     <div
@@ -327,16 +399,22 @@ function DialogInner({
         data-alert={icon ? "" : undefined}
         data-inactive={active ? undefined : ""}
         className={clsx(styles.dialog, popup ? styles.popup : styles.window, className)}
-        style={{ width, translate: offset.x || offset.y ? `${offset.x}px ${offset.y}px` : undefined }}
+        onPointerDown={drag}
+        style={{
+          width: size ? size.w : width,
+          height: size?.h,
+          maxHeight: !size && maxHeight ? `min(${maxHeight}px, 100%)` : undefined,
+          translate: offset.x || offset.y ? `${offset.x}px ${offset.y}px` : undefined,
+        }}
       >
         {icon ? null : popup ? (
           title != null && (
-            <div className={styles.popupHeader}>
+            <div className={styles.popupHeader} data-dialog-drag="">
               <span className={styles.title}>{title}</span>
             </div>
           )
         ) : platform === "mac" ? (
-          <div className={clsx(styles.titleBar, styles.macTitleBar)} onPointerDown={drag} data-dialog-titlebar="">
+          <div className={clsx(styles.titleBar, styles.macTitleBar)} data-dialog-drag="" data-dialog-titlebar="">
             <span className={styles.lights}>
               <button
                 type="button"
@@ -353,18 +431,22 @@ function DialogInner({
             <span className={styles.title}>{title}</span>
           </div>
         ) : (
-          <div className={styles.titleBar} onPointerDown={drag} data-dialog-titlebar="">
+          <div className={styles.titleBar} data-dialog-drag="" data-dialog-titlebar="">
             <span className={styles.title}>{title}</span>
             <IconButton icon="close" title="Close" size="small" tabIndex={-1} onClick={onClose} />
           </div>
         )}
         {icon ? (
-          <div className={styles.message} data-dialog-body="" onPointerDown={drag}>
-            <MessageIcon kind={icon} />
+          <div className={styles.message} data-dialog-body="" data-dialog-drag="">
+            {icon === "app" ? (
+              <img className={styles.messageAppIcon} src={appIcon} alt="" draggable={false} />
+            ) : (
+              <MessageIcon kind={icon} />
+            )}
             <div className={styles.messageText}>
               {title != null && <div className={clsx(styles.messageTitle, selectableText)}>{title}</div>}
               <div className={clsx(styles.messageBody, selectableText)}>
-                {typeof children === "string" ? tx(children) : children}
+                {typeof children === "string" ? given(children) : children}
               </div>
               {footerStart && <div className={styles.messageExtra}>{footerStart}</div>}
             </div>
@@ -376,7 +458,7 @@ function DialogInner({
         )}
         {icon
           ? !!buttons?.length && (
-              <div className={clsx(styles.footer, styles.messageFooter)} data-dialog-footer="" onPointerDown={drag}>
+              <div className={clsx(styles.footer, styles.messageFooter)} data-dialog-footer="" data-dialog-drag="">
                 <DialogButtons buttons={buttons} onCancel={onClose} platform={platform} />
               </div>
             )
@@ -392,6 +474,15 @@ function DialogInner({
                 {!!buttons?.length && <DialogButtons buttons={buttons} onCancel={onClose} platform={platform} />}
               </div>
             )}
+        {canResize && (
+          <div
+            className={styles.resizeGrip}
+            role="separator"
+            aria-orientation="vertical"
+            aria-label={tx("Resize")}
+            onPointerDown={resize}
+          />
+        )}
       </div>
     </div>,
     document.body,

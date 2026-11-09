@@ -6,6 +6,13 @@ block-comment = ["/*", "*/"]
 indent = { tab-size = 4, insert-spaces = true }
 ui-mode = "Java"
 tree-sitter = "java"
+scratch-template = '''
+class Scratch {
+    public static void main(String[] args) {
+        $END$
+    }
+}
+'''
 
 # Microsoft java-debug runs inside jdtls as a bundle (`initializationOptions.bundles`,
 # added when installed); sessions start with `vscode.java.startDebugSession` and the
@@ -32,12 +39,14 @@ resolveAdditionalTextEditsSupport = true
 
 [language-servers.initialization-options.settings.java]
 autobuild = { enabled = true }
-contentProvider = { preferred = "fernflower" }
+contentProvider = { preferred = "fernflowerContentProvider" }
 maven = { downloadSources = true, updateSnapshots = false }
 eclipse = { downloadSources = true }
 references = { includeDecompiledSources = true }
 signatureHelp = { enabled = true }
+symbols = { includeGeneratedCode = true }
 configuration = { updateBuildConfiguration = "automatic" }
+project = { referencedLibraries = ["lib/**/*.jar"] }
 # Generated code (implement methods, getters, toString…) indents like the editor (`indent` above).
 format = { insertSpaces = true, tabSize = 4 }
 # Calls complete as `name()` with the caret inside and parameter info, not guessed arguments;
@@ -50,3 +59,10 @@ generatesMetadataFilesAtProjectRoot = false
 exclusions = ["**/node_modules/**", "**/.metadata/**", "**/archetype-resources/**", "**/META-INF/maven/**"]
 maven = { enabled = true }
 gradle = { enabled = true, wrapper = { enabled = true } }
+
+[[language-servers]]
+name = "kmp-lsp"
+fallback = true
+command = "kmp-lsp"
+root-markers = ["pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "build.xml", ".project"]
+install-hint = "Install kmp-lsp in Settings › Languages & Frameworks › Language Servers (https://github.com/Hessesian/kmp-lsp)"

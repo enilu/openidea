@@ -8,6 +8,7 @@ import { useEffect, useMemo, useState, type MouseEvent } from "react";
 import { Checkbox, Dialog, Icon, Kbd, T } from "@/ui";
 import type { Action } from "@/platform/actions";
 import { formatBinding, mouseStrokeOf, normalizeBinding, suspendKeyboardDispatch } from "@/platform/keymap";
+import { isPageSwipe } from "@/platform/pageSwipe";
 import { ask } from "@/workbench/messages";
 import { findConflicts, resolveBindings, type Conflict, type KeymapDraft } from "./model";
 import { groupPath } from "./groups";
@@ -22,7 +23,7 @@ export interface RecordShortcutDialogProps {
   onCancel: () => void;
   /** `removeConflicts`: also unbind the conflicting assignments. */
   onSubmit: (binding: string, conflicts: Conflict[], removeConflicts: boolean) => void;
-  /** Record a mouse shortcut (side buttons with modifiers) instead of keys. */
+  /** Record a mouse shortcut (modified left clicks or side buttons) instead of keys. */
   mouse?: boolean;
 }
 
@@ -31,7 +32,8 @@ export function RecordShortcutDialog({ action, actions, draft, onCancel, onSubmi
   const [second, setSecond] = useState("");
   const [useSecond, setUseSecond] = useState(false);
 
-  const binding = mouse ? first : first && useSecond ? (second ? `${first} ${second}` : "") : first;
+  const binding =
+    mouse || isPageSwipe(first) ? first : first && useSecond ? (second ? `${first} ${second}` : "") : first;
   const conflicts = useMemo(
     () => (binding ? findConflicts(draft, binding, action.id, actions) : []),
     [binding, draft, action.id, actions],
@@ -79,7 +81,7 @@ export function RecordShortcutDialog({ action, actions, draft, onCancel, onSubmi
           <KeyStrokes
             first={first}
             second={second}
-            useSecond={useSecond}
+            useSecond={useSecond && !isPageSwipe(first)}
             setFirst={setFirst}
             setSecond={setSecond}
             setUseSecond={setUseSecond}
@@ -162,7 +164,7 @@ function KeyStrokes({ first, second, useSecond, setFirst, setSecond, setUseSecon
         <StrokeRecorder autoFocus value={first} onChange={setFirst} aria-label="First stroke" />
       </div>
       <div className={styles.recordRow}>
-        <Checkbox checked={useSecond} onChange={setUseSecond} label="Second stroke:" />
+        <Checkbox checked={useSecond} onChange={setUseSecond} disabled={isPageSwipe(first)} label="Second stroke:" />
         <StrokeRecorder
           value={second}
           onChange={setSecond}
@@ -178,7 +180,7 @@ function KeyStrokes({ first, second, useSecond, setFirst, setSecond, setUseSecon
   );
 }
 
-/** Pad that records a side-button click with its modifiers; shortcuts stay off while the dialog is open. */
+/** Record modified left clicks and side buttons; shortcuts stay off while the dialog is open. */
 function MouseRecorder({ value, onChange }: { value: string; onChange: (binding: string) => void }) {
   useEffect(() => suspendKeyboardDispatch(), []);
   const record = (e: MouseEvent<HTMLDivElement>) => {
@@ -202,7 +204,7 @@ function MouseRecorder({ value, onChange }: { value: string; onChange: (binding:
         <span className={styles.recorded}>{formatBinding(value)}</span>
       ) : (
         <span className={styles.recorderPlaceholder}>
-          <T>Click here with a mouse side button, holding any modifiers</T>
+          <T>Click here with Ctrl, Alt or Command held, or use a mouse side button</T>
         </span>
       )}
     </div>

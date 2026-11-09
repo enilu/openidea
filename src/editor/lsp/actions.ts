@@ -1,9 +1,12 @@
 /** Actions of the LSP editor layer (ids from keymaps/intellij-macos.ts). */
+import { isGenerateAction } from "./generate";
 import type { EditorView } from "@codemirror/view";
 import { executeAction, registerActions, type Action } from "@/platform/actions";
 import { activeEditor, editorsFor, registerSaveParticipant, type TextEditorHandle } from "@/editor/api";
 import { maybeEditorService } from "@/workbench/contributions";
 import { useProject } from "@/platform/project";
+import { validateLanguages } from "@/platform/languageSettings";
+import type { Settings } from "@/bindings";
 import { explicitCompletion } from "./completion";
 import { triggerSignatureHelp } from "./signature";
 import { quickDefinition, quickDocumentation } from "./hover";
@@ -11,12 +14,19 @@ import { expressionTypeInfo } from "./typeInfo";
 import { gotoHighlightedUsage, gotoTargets, highlightUsages } from "./navigation";
 import { gotoDiagnostic, showErrorDescription } from "./diagnostics";
 import { applyKindSilently, applyQuickFix, runKindAction, showIntentions } from "./intentions";
-import { implementPythonAbstractMethods } from "./pythonMembers";
+import { docOf } from "./lsp";
+import { languageSemantics } from "./semantic";
 import { workflowSettings, type ActionsOnSaveValid } from "@/platform/workflowSettings";
 import { startRename } from "./rename";
 import { formatDocument, reformatDialog } from "./format";
 import { showHint } from "./hint";
-import { refactorThis, runRefactoring, safeDelete, showNothingHere } from "@/editor/refactor";
+import {
+  refactorThis,
+  runRefactoring,
+  safeDelete,
+  showNothingHere,
+  startHierarchyRefactoring,
+} from "@/editor/refactor";
 import { evaluateWhen } from "@/platform/context";
 
 /** Editor actions apply to the active text editor unless a tool window or popup owns the keyboard. */
@@ -115,14 +125,23 @@ function editorAction(
   return { id, title, category, when: EDITOR_WHEN, run: withEditor(run), ...extra };
 }
 
+/** Whether saving a `language` file formats it: Format on save, or Run on save of an external formatter. */
+export function formatsOnSave(settings: Settings | null, language: string): boolean {
+  const { prettier, oxfmt, ruff } = validateLanguages(settings?.languages);
+  return (
+    !!settings?.editor?.formatOnSave ||
+    [prettier, oxfmt, ruff].some((formatter) => formatter.runOnSave && formatter.languages.includes(language))
+  );
+}
+
 /** Format on save (settings.editor.formatOnSave), run by editor/core before writing. */
 export function registerFormatOnSave(): () => void {
   return registerSaveParticipant({
     id: "lsp.formatOnSave",
     order: 50,
     beforeSave: async (ctx, handle) => {
-      if (!handle || ctx.readOnly || !useProject.getState().settings?.editor?.formatOnSave) return;
-      await formatDocument(handle.view, { explicit: false, selectionOnly: false });
+      if (!handle || ctx.readOnly || !formatsOnSave(useProject.getState().settings, ctx.language)) return;
+      await formatDocument(handle.view, { explicit: false, selectionOnly: false, onSave: true });
     },
   });
 }
@@ -174,6 +193,27 @@ export function registerLspActions(): () => void {
     editorAction("code.reformat", "Reformat Code", "Code", reformat, {
       keywords: ["format", "prettier"],
     }),
+    editorAction(
+      "code.reformatWithPrettier",
+      "Reformat with Prettier",
+      "Code",
+      (v) => formatDocument(v, { explicit: true, tool: "prettier" }),
+      { keywords: ["format", "prettier"] },
+    ),
+    editorAction(
+      "code.reformatWithOxfmt",
+      "Reformat with oxfmt",
+      "Code",
+      (v) => formatDocument(v, { explicit: true, tool: "oxfmt" }),
+      { keywords: ["format", "oxfmt", "oxc"] },
+    ),
+    editorAction(
+      "code.reformatWithRuff",
+      "Reformat with Ruff",
+      "Code",
+      (v) => formatDocument(v, { explicit: true, tool: "ruff" }),
+      { keywords: ["format", "ruff", "python"] },
+    ),
     editorAction("code.reformatDialog", "Reformat File…", "Code", (v) =>
       reformatDialog(v, (view) => applyKindSilently(view, "source.organizeImports")),
     ),
@@ -281,14 +321,19 @@ export function registerLspActions(): () => void {
       "Code",
       (v) =>
         runKindAction(v, "", {
-          title:
-            /^(generate|implement|override|add (missing|derive|impl|getter|setter|constructor)|create (constructor|getter|setter))/i,
+          predicate: isGenerateAction,
           none: "Nothing to generate here",
           label: "Generate",
         }),
       { keyWhen: GENERATE_KEY_WHEN },
     ),
     editorAction("refactor.inline", "Inline…", "Refactor", (v) => runRefactoring(v, "inline")),
+    editorAction("refactor.pullMembersUp", "Pull Members Up…", "Refactor", (v) =>
+      startHierarchyRefactoring(v, "pullUp"),
+    ),
+    editorAction("refactor.pushMembersDown", "Push Members Down…", "Refactor", (v) =>
+      startHierarchyRefactoring(v, "pushDown"),
+    ),
     // Implement / Override Methods: the server's code actions for them (jdtls "Override/Implement
     // Methods…", rust-analyzer "Implement missing members", TS "Implement interface"…).
     editorAction("code.implementMethods", "Implement Methods…", "Code", (v) =>
@@ -296,7 +341,7 @@ export function registerLspActions(): () => void {
         title: IMPLEMENT_TITLE,
         none: "Nothing to implement",
         label: "Implement Members",
-        fallback: () => implementPythonAbstractMethods(v),
+        fallback: () => languageSemantics(docOf(v)?.language)?.implementMethods?.(v) ?? Promise.resolve(false),
       }),
     ),
     editorAction("code.overrideMethods", "Override Methods…", "Code", (v) =>

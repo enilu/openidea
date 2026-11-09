@@ -16,10 +16,12 @@ pub struct AppState {
     pub host: Arc<Host>,
     pub startup: Startup,
     pub recent: RecentProjects,
-    /// WASM plugins (`ide-plugin`), shared by all windows.
-    pub plugins: Arc<ide_plugin::PluginHost>,
+    /// Plugins (`ide_host::plugins`), shared by all windows.
+    pub plugins: Arc<ide_host::plugins::PluginHost>,
     /// The built-in web server (Open In › Browser, the editor's browser bar).
     pub web: ide_web::WebServer,
+    /// Tools › MCP Server: built-in IDE tools for agents.
+    pub mcp: crate::commands::mcp::McpService,
     /// Credential prompts of `ssh` / `git` child processes (`None` if it failed to start).
     pub askpass: Option<ide_ssh::askpass::AskpassServer>,
     /// Remote development connections, by window label.
@@ -64,21 +66,28 @@ impl AppState {
         }
         let config_dir = app.path().app_config_dir()?;
         let data_dir = app.path().app_data_dir()?;
+        let local_data_dir = app.path().app_local_data_dir()?;
         std::fs::create_dir_all(&config_dir)?;
         std::fs::create_dir_all(&data_dir)?;
+        if let Err(error) = std::fs::create_dir_all(&local_data_dir) {
+            tracing::warn!(?local_data_dir, %error, "cannot create local data directory");
+        }
+        tracing::info!(?data_dir, ?local_data_dir, "application data directories");
         // Saved git HTTPS credentials (askpass answers them silently).
         ide_ssh::git_creds::init(data_dir.join("git-credentials.json"));
         // File › Invalidate Caches… requested at the last run.
-        let removed = ide_workspace::caches::apply_pending(&data_dir);
+        let removed = ide_workspace::caches::apply_pending(&data_dir, &local_data_dir);
         if !removed.is_empty() {
             tracing::info!("invalidated caches: {removed:?}");
         }
+        ide_host::data_dirs::migrate(&data_dir, &local_data_dir);
         let global_sink: SharedSink = Arc::new(TauriSink { app: app.clone(), window: None });
         let languages = Arc::new(LanguageRegistry::load(Some(&config_dir.join("languages")))?);
         let sink_app = app.clone();
         let host = Arc::new(Host::new(ide_host::HostConfig {
             config_dir: config_dir.clone(),
             data_dir: data_dir.clone(),
+            local_data_dir,
             languages: languages.clone(),
             syntax,
             sink_for: Box::new(move |window| {
@@ -92,8 +101,9 @@ impl AppState {
             recent: RecentProjects::load(&config_dir),
             askpass: start_askpass(&app),
             sink: global_sink,
-            plugins: crate::commands::plugin::create_host(&app, &data_dir)?,
+            plugins: crate::commands::plugin::create_host(&app, &data_dir, &host)?,
             web: ide_web::WebServer::new(),
+            mcp: Default::default(),
             remote_dev: crate::remote_dev::Connections::default(),
             host,
             startup: Startup {
@@ -124,7 +134,7 @@ impl AppState {
 
     /// The window that owns what `window` starts: a settings window's parent, else `window`.
     pub fn owner_window(window: &str) -> &str {
-        crate::windows::settings_parent(window).unwrap_or(window)
+        crate::windows::auxiliary_parent(window).unwrap_or(window)
     }
 
     /// Opens `root` in `window` and records it in the recent projects.
@@ -138,6 +148,7 @@ impl AppState {
         if !display_name.trim().is_empty() {
             self.recent.rename(&project.root, Some(display_name.trim()))?;
         }
+        crate::jump_list::refresh(&self.app, self.recent.list());
         Ok(project)
     }
 
@@ -147,9 +158,11 @@ impl AppState {
         self.host.open_light(window, file)
     }
 
+    /// Called on the event-loop thread (window destruction, the `close_project`
+    /// command), so it must not wait for the project's workers to shut down.
     pub fn close_project(&self, window: &str) {
         self.remote_dev.disconnect(window);
-        self.host.close_project(window);
+        self.host.close_project_detached(window);
     }
 }
 

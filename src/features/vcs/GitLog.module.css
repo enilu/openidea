@@ -60,8 +60,17 @@
   min-width: 60px;
 }
 .branchTree {
+  --tree-detail-flex-shrink: 0;
   flex: 1;
   min-height: 0;
+}
+.branchDetail {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  line-height: 1;
+  vertical-align: middle;
 }
 
 /* filters */
@@ -74,6 +83,18 @@
 .textFilter {
   flex: 0 1 260px;
   min-width: 100px;
+}
+.filterGroup {
+  position: relative;
+  flex: 0 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  overflow: hidden;
+}
+.filterHidden {
+  visibility: hidden;
 }
 .filterButton {
   flex: none;
@@ -127,17 +148,30 @@
 
 /* commit table */
 .listWrap {
+  position: relative;
   flex: 1;
   min-height: 0;
   display: flex;
   flex-direction: column;
   min-width: 0;
 }
+.speedSearch {
+  position: absolute;
+  top: 4px;
+  right: 8px;
+  z-index: 1;
+  padding: 4px 8px;
+  background: var(--bg-popup);
+  border: 1px solid var(--border);
+  color: var(--fg);
+}
 .list {
   flex: 1;
   min-height: 0;
   overflow: auto;
   outline: none;
+  /* Rows coming and going while scrolling relay out the list alone, not the workbench. */
+  contain: strict;
 }
 .row {
   position: absolute;
@@ -153,20 +187,65 @@
   cursor: default;
   font-size: var(--fs-ui);
 }
-/* View Options › Highlight › Current Branch: commits outside HEAD are dimmed. */
-.offBranch .subject,
-.offBranch .muted {
+.columnHeader {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--bg-app);
+  border-bottom: 1px solid var(--border);
   color: var(--fg-subtle);
+}
+.columnHeader:hover {
+  background: var(--bg-app);
+}
+.columnCell {
+  flex: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.columnHeading {
+  position: relative;
+  padding-inline-end: 6px;
+  cursor: grab;
+  touch-action: none;
+}
+.columnHeading.dragSource {
+  cursor: grabbing;
+  opacity: 0.6;
+}
+.columnHeading.dropBefore {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.columnHeading.dropAfter {
+  box-shadow: inset -2px 0 0 var(--accent);
+}
+.columnResize {
+  position: absolute;
+  inset-block: 0;
+  inset-inline-end: 0;
+  width: 6px;
+  cursor: col-resize;
+  touch-action: none;
+}
+.columnResize:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+/* View Options › Highlight › Current Branch: commits reachable from HEAD are tinted. */
+.currentBranch {
+  --log-row-bg: var(--bg-log-current-branch);
+  background: var(--log-row-bg);
 }
 .row:hover {
   background: var(--bg-tree-hover);
 }
 .selected,
 .selected:hover {
-  background: var(--bg-tree-selected-inactive);
+  --log-row-bg: var(--bg-tree-selected-inactive);
+  background: var(--log-row-bg);
 }
 .list:focus-within .selected {
-  background: var(--bg-tree-selected);
+  --log-row-bg: var(--bg-tree-selected);
 }
 .colSubject {
   flex: 1;
@@ -174,8 +253,9 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  /* Let graph endpoints overlap adjacent rows; text is clipped by .subject. */
-  overflow: visible;
+  /* Let graph endpoints overlap adjacent rows, but never paint over the next column. */
+  overflow-x: clip;
+  overflow-y: visible;
 }
 .colAuthor {
   flex: none;
@@ -221,7 +301,9 @@
   overflow: visible;
 }
 .refs {
-  flex: none;
+  flex: 0 1 auto;
+  /* Shrinks to the first label's icon when the graph leaves no room. */
+  min-width: 11px;
   display: inline-flex;
   align-items: center;
   gap: 8px;
@@ -242,6 +324,7 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  min-width: 0;
   max-width: 180px;
 }
 /* Outlined tag glyph in the ref's colour. */
@@ -316,6 +399,21 @@
   text-overflow: ellipsis;
   color: var(--fg-subtle);
 }
+.lineStats {
+  display: inline-flex;
+  gap: 6px;
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+.fileRow .lineStats {
+  margin-left: auto;
+}
+.lineAdded {
+  color: var(--vcs-added);
+}
+.lineRemoved {
+  color: var(--vcs-deleted);
+}
 .messageBox {
   height: 100%;
   overflow: auto;
@@ -324,6 +422,21 @@
   -webkit-user-select: text;
   user-select: text;
   font-size: var(--fs-ui);
+}
+.commitTooltip {
+  width: min(520px, calc(100vw - 32px));
+  max-height: 60vh;
+  overflow: auto;
+  padding: 12px;
+  white-space: normal;
+  user-select: text;
+}
+.revisionSource {
+  flex: 1;
+  min-height: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
 }
 .subjectLine {
   color: var(--fg-strong);
@@ -356,6 +469,11 @@
   margin-left: 0;
   max-width: none;
   flex-wrap: wrap;
+}
+.meta .ref {
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 .hash {
   font-family: var(--font-mono);
@@ -392,7 +510,7 @@
   font-size: var(--fs-small);
   line-height: 18px;
   -webkit-user-select: text;
-  cursor: text;
+  cursor: default;
   -webkit-user-select: text;
   user-select: text;
 }
@@ -400,6 +518,7 @@
   white-space: pre-wrap;
   word-break: break-all;
   color: var(--fg-secondary);
+  cursor: text;
 }
 .line-cmd {
   color: var(--fg-emphasis);
@@ -502,7 +621,6 @@
 .worktreeList {
   flex: 1;
   min-height: 0;
-  overflow: auto;
 }
 
 .colRepository {

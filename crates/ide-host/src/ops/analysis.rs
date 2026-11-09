@@ -39,12 +39,13 @@ fn load(project: &Project, languages: &LanguageRegistry, path: &Path) -> Option<
         let snap = project.documents.text_snapshot(doc).ok()?;
         return (!snap.large).then_some((snap.language, snap.text));
     }
-    let loaded = ide_vfs::load_text(path).ok()?;
+    let loaded = project.documents.load_file(path).ok()?;
     if loaded.binary || loaded.large || loaded.too_large {
         return None;
     }
-    let language = languages.detect(path, loaded.text.lines().next());
-    Some((language, loaded.text))
+    let text = ide_text::normalize_line_endings(&loaded.text).into_owned();
+    let language = languages.detect(path, text.lines().next());
+    Some((language, text))
 }
 
 // ---- Inspect Code ----
@@ -133,21 +134,22 @@ pub async fn inspect_code(
     let cancel = host.begin_request(request);
     let listed = {
         let (project, cancel) = (project.clone(), cancel.clone());
-        blocking(move || files_in_scope(&project, &scope, &cancel)).await
+        blocking(move || {
+            let files = files_in_scope(&project, &scope, &cancel)?;
+            let total = files.len() as u32;
+            let rel: std::collections::HashMap<_, _> =
+                files.into_iter().filter(|f| project.lsp.serves_path(&f.path)).map(|f| (f.path, f.rel_path)).collect();
+            Ok((total, rel))
+        })
+        .await
     };
-    let files = match listed {
+    let (total_in_scope, rel) = match listed {
         Ok(files) => files,
         Err(e) => {
             host.end_request(request);
             return Err(e);
         }
     };
-    let total_in_scope = files.len() as u32;
-    let rel: std::collections::HashMap<_, _> = files
-        .iter()
-        .filter(|f| project.lsp.serves_path(&f.path))
-        .map(|f| (f.path.clone(), f.rel_path.clone()))
-        .collect();
     let mut summary = InspectSummary { skipped: total_in_scope - rel.len() as u32, ..Default::default() };
     let _ = on_event.send(InspectEvent::Started { total: rel.len() as u32 });
 

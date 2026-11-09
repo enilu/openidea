@@ -103,6 +103,105 @@ describe("Dialog chrome", () => {
     expect(document.querySelector("[data-dialog-titlebar]")).toBeNull();
   });
 
+  it("drags a popup by a [data-dialog-drag] handle, but not by its controls or body", () => {
+    render(
+      <Dialog open onClose={() => {}} position="top" aria-label="Search Everywhere">
+        <div data-dialog-drag="">
+          <span>header</span>
+          <button>tab</button>
+        </div>
+        <div>rows</div>
+      </Dialog>,
+    );
+    const dialog = screen.getByRole("dialog");
+    const handle = dialog.querySelector("[data-dialog-drag]")!;
+    const down = (el: Element, x: number) => fireEvent.pointerDown(el, { button: 0, clientX: x, clientY: 10 });
+    down(handle.querySelector("button")!, 10);
+    down(dialog.querySelector("div:last-child")!, 10);
+    expect(dialog.style.translate).toBe("");
+    down(handle, 10);
+    fireEvent.pointerMove(window, { buttons: 1, clientX: 200, clientY: 40 });
+    fireEvent.pointerUp(window);
+    expect(dialog.style.translate).toBe("190px 30px");
+  });
+
+  it("resizes a top popup by its corner, keeping its top edge, and reports the size", () => {
+    const onResized = vi.fn();
+    render(
+      <Dialog
+        open
+        onClose={() => {}}
+        position="top"
+        aria-label="Find in Files"
+        width={400}
+        resizable="both"
+        minWidth={200}
+        minHeight={100}
+        onResized={onResized}
+      >
+        <div>rows</div>
+      </Dialog>,
+    );
+    const dialog = screen.getByRole("dialog");
+    fireEvent.pointerDown(screen.getByRole("separator", { name: "Resize" }), { button: 0, clientX: 0, clientY: 0 });
+    fireEvent.pointerMove(window, { buttons: 1, clientX: 500, clientY: 300 });
+    fireEvent.pointerUp(window);
+    expect([dialog.style.width, dialog.style.height]).toEqual(["500px", "300px"]);
+    expect(dialog.style.translate).toBe("250px 0px");
+    expect(onResized).toHaveBeenCalledExactlyOnceWith({ w: 500, h: 300 });
+  });
+
+  it("opens a resizable popup at a remembered size", () => {
+    render(
+      <Dialog
+        open
+        onClose={() => {}}
+        position="top"
+        aria-label="Find in Files"
+        resizable="both"
+        initialSize={{ w: 600, h: 400 }}
+      >
+        <div>rows</div>
+      </Dialog>,
+    );
+    const dialog = screen.getByRole("dialog");
+    expect([dialog.style.width, dialog.style.height]).toEqual(["600px", "400px"]);
+  });
+
+  it("caps a content-sized dialog at maxHeight until it is resized", () => {
+    render(
+      <Dialog open onClose={() => {}} title="Push" resizable="both" maxHeight={720}>
+        <div>rows</div>
+      </Dialog>,
+    );
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.style.maxHeight).toBe("min(720px, 100%)");
+    fireEvent.pointerDown(screen.getByRole("separator", { name: "Resize" }), { button: 0, clientX: 0, clientY: 0 });
+    fireEvent.pointerMove(window, { buttons: 1, clientX: 500, clientY: 800 });
+    fireEvent.pointerUp(window);
+    expect(dialog.style.maxHeight).toBe("");
+    expect(dialog.style.height).not.toBe("");
+  });
+
+  it("still drags a window dialog by its title bar", () => {
+    render(
+      <Dialog open onClose={() => {}} title="Usages Detected" buttons={safeDelete()} platform="other">
+        <p>Usages found</p>
+      </Dialog>,
+    );
+    const dialog = screen.getByRole("dialog");
+    const bar = document.querySelector("[data-dialog-titlebar]") as HTMLElement;
+    fireEvent.pointerDown(bar, { button: 0, clientX: 10, clientY: 10 });
+    fireEvent.pointerMove(window, { buttons: 1, clientX: 60, clientY: 40 });
+    fireEvent.pointerUp(window);
+    expect(dialog.style.translate).toBe("80px 30px");
+    // The close button never starts a drag.
+    fireEvent.pointerDown(within(bar).getByRole("button", { name: "Close" }), { button: 0, clientX: 10, clientY: 10 });
+    fireEvent.pointerMove(window, { buttons: 1, clientX: 200, clientY: 40 });
+    fireEvent.pointerUp(window);
+    expect(dialog.style.translate).toBe("80px 30px");
+  });
+
   it("renders the help button and footer start on the left", () => {
     const onHelp = vi.fn();
     render(

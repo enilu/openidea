@@ -3,6 +3,7 @@ import { DEFAULT_DEPLOYMENT_SERVER } from "@/platform/remoteSettings";
 import {
   addMapping,
   fixDefaultServer,
+  folderWithin,
   formatExcludes,
   newServer,
   nextServerName,
@@ -54,6 +55,7 @@ describe("server list", () => {
     expect(nextServerName([a])).toBe("Server 2");
     expect(nextServerName([{ ...a, name: "Server 2" }])).toBe("Server 3");
     const fresh = newServer([a]);
+    expect(fresh.kind).toBe("sftp");
     expect(fresh.name).toBe("Server 2");
     expect(fresh.id).not.toBe("");
     expect(fresh.mappings).toEqual([{ local: "", deployment: "", web: "" }]);
@@ -61,6 +63,14 @@ describe("server list", () => {
     const copy = newServer([a], { ...a, rootPath: "/srv", excludedPaths: ["/srv/cache"] });
     expect(copy).toMatchObject({ name: "Server 1 (copy)", rootPath: "/srv", excludedPaths: ["/srv/cache"] });
     expect(copy.id).not.toBe("a");
+  });
+
+  it("copies a local server without changing its type or mappings", () => {
+    const local = { ...a, kind: "local" as const, rootPath: "/mounted/www" };
+    const copy = newServer([local], local);
+    expect(copy).toMatchObject({ kind: "local", rootPath: "/mounted/www", sshConfig: "" });
+    expect(copy.mappings).toEqual(local.mappings);
+    expect(copy.mappings).not.toBe(local.mappings);
   });
 
   it("keeps the default server valid", () => {
@@ -72,5 +82,16 @@ describe("server list", () => {
   it("walks up remote folders", () => {
     expect(remoteParent("/var/www/")).toBe("/var");
     expect(remoteParent("/var")).toBe("/");
+  });
+});
+
+describe("chosen mapping folders", () => {
+  it("are relative to the project or the server's root path", () => {
+    expect(folderWithin("/work/shop", "/work/shop/web/public")).toBe("web/public");
+    expect(folderWithin("/var/www/", "/var/www/site")).toBe("site");
+    expect(folderWithin("/var/www", "/var/www/")).toBe("");
+    expect(folderWithin("/var/www", "/var/wwwroot")).toBeNull();
+    expect(folderWithin("/var/www", "/srv")).toBeNull();
+    expect(folderWithin("", "/srv")).toBeNull();
   });
 });

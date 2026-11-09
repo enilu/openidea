@@ -106,7 +106,7 @@ pub(crate) fn merge_args(branches: &[String], o: &MergeOptions) -> IdeResult<Vec
     if branches.is_empty() {
         return Err(IdeError::invalid("no branch to merge"));
     }
-    let mut args: Vec<String> = vec!["merge".into(), "--autostash".into()];
+    let mut args: Vec<String> = vec!["merge".into()];
     args.extend(merge_flags(o)?.into_iter().map(String::from));
     match o.message.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
         Some(m) => args.extend(["-m".into(), m.to_string()]),
@@ -120,7 +120,7 @@ pub(crate) fn merge_args(branches: &[String], o: &MergeOptions) -> IdeResult<Vec
 
 /// `git rebase` arguments for the Rebase dialog.
 pub(crate) fn rebase_args(upstream: &str, o: &RebaseOptions) -> IdeResult<Vec<String>> {
-    let mut args: Vec<String> = vec!["rebase".into(), "--autostash".into()];
+    let mut args: Vec<String> = vec!["rebase".into()];
     if o.rebase_merges {
         args.push("--rebase-merges".into());
     }
@@ -137,7 +137,7 @@ pub(crate) fn rebase_args(upstream: &str, o: &RebaseOptions) -> IdeResult<Vec<St
 /// `git pull` arguments for the Pull dialog: `remote` and its `branches` (none = the
 /// upstream's configured merge branch).
 pub(crate) fn pull_args(remote: &str, branches: &[String], rebase: bool, o: &MergeOptions) -> IdeResult<Vec<String>> {
-    let mut args: Vec<String> = vec!["pull".into(), "--progress".into(), "--autostash".into()];
+    let mut args: Vec<String> = vec!["pull".into(), "--progress".into()];
     if rebase {
         if o.no_ff || o.ff_only || o.squash || o.no_commit {
             return Err(IdeError::invalid("--rebase cannot be combined with merge options"));
@@ -210,16 +210,18 @@ pub(crate) fn parse_worktrees(text: &str) -> Vec<Worktree> {
 impl Repo {
     /// Merges `branches` into the current branch (Git › Merge…).
     pub fn merge_with(&self, branches: &[String], options: &MergeOptions) -> IdeResult<()> {
+        let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
         let args = merge_args(branches, options)?;
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        run(self.root(), &args, None).map(|_| ())
+        crate::preserve::around(self, "Local changes saved before merge", || run(self.root(), &args, None).map(|_| ()))
     }
 
     /// Rebases the current branch onto `upstream` (or `upstream..HEAD` onto `options.onto`).
     pub fn rebase_with(&self, upstream: &str, options: &RebaseOptions) -> IdeResult<()> {
+        let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
         let args = rebase_args(upstream, options)?;
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        run(self.root(), &args, None).map(|_| ())
+        crate::preserve::around(self, "Local changes saved before rebase", || run(self.root(), &args, None).map(|_| ()))
     }
 
     /// Git › Pull…: pulls `branches` of `remote` into the current branch.
@@ -232,13 +234,17 @@ impl Repo {
         cancel: &CancellationToken,
         on_output: &dyn Fn(String),
     ) -> IdeResult<()> {
+        let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
         let args = pull_args(remote, branches, rebase, options)?;
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        cli::run_streaming(self.root(), &args, cancel, on_output)
+        crate::preserve::around(self, "Local changes saved before update", || {
+            cli::run_streaming(self.root(), &args, cancel, on_output)
+        })
     }
 
     /// Manage Remotes: adds, removes or edits a remote.
     pub fn edit_remote(&self, edit: &RemoteEdit) -> IdeResult<()> {
+        let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
         match edit {
             RemoteEdit::Add { name, url } => {
                 let (name, url) = (arg(name, "remote name")?, arg(url, "URL")?);
@@ -262,6 +268,7 @@ impl Repo {
 
     /// Working trees of the repository, the main one first.
     pub fn worktrees(&self) -> IdeResult<Vec<Worktree>> {
+        let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
         let out = run(self.root(), &["worktree", "list", "--porcelain"], None)?;
         Ok(parse_worktrees(&out.stdout_str()))
     }
@@ -269,6 +276,7 @@ impl Repo {
     /// Git › New Worktree…: checks out `commitish` at `path`, on a new branch `new_branch`
     /// when given (otherwise `commitish` must be a branch not checked out elsewhere).
     pub fn add_worktree(&self, path: &Path, commitish: &str, new_branch: Option<&str>) -> IdeResult<()> {
+        let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
         let path = path.to_string_lossy().into_owned();
         let commitish = arg(commitish, "revision")?;
         let mut args: Vec<String> = vec!["worktree".into(), "add".into()];
@@ -281,6 +289,7 @@ impl Repo {
     }
 
     pub fn remove_worktree(&self, path: &Path, force: bool) -> IdeResult<()> {
+        let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
         let path = path.to_string_lossy().into_owned();
         let mut args = vec!["worktree", "remove"];
         if force {
@@ -298,13 +307,10 @@ mod tests {
     #[test]
     fn merge_args_follow_the_options() {
         let o = MergeOptions { no_ff: true, message: Some("Merge it".into()), ..Default::default() };
-        assert_eq!(
-            merge_args(&["dev".into()], &o).unwrap(),
-            ["merge", "--autostash", "--no-ff", "-m", "Merge it", "dev"]
-        );
+        assert_eq!(merge_args(&["dev".into()], &o).unwrap(), ["merge", "--no-ff", "-m", "Merge it", "dev"]);
         assert_eq!(
             merge_args(&["a".into(), "b".into()], &MergeOptions::default()).unwrap(),
-            ["merge", "--autostash", "--no-edit", "a", "b"]
+            ["merge", "--no-edit", "a", "b"]
         );
         let bad = MergeOptions { ff_only: true, squash: true, ..Default::default() };
         assert!(merge_args(&["dev".into()], &bad).is_err());
@@ -315,18 +321,15 @@ mod tests {
     #[test]
     fn rebase_and_pull_args() {
         let o = RebaseOptions { onto: Some("main".into()), rebase_merges: true, keep_empty: false };
-        assert_eq!(
-            rebase_args("feature~3", &o).unwrap(),
-            ["rebase", "--autostash", "--rebase-merges", "--onto", "main", "feature~3"]
-        );
+        assert_eq!(rebase_args("feature~3", &o).unwrap(), ["rebase", "--rebase-merges", "--onto", "main", "feature~3"]);
         assert_eq!(
             pull_args("origin", &["main".into()], false, &MergeOptions { ff_only: true, ..Default::default() })
                 .unwrap(),
-            ["pull", "--progress", "--autostash", "--no-rebase", "--ff-only", "origin", "main"]
+            ["pull", "--progress", "--no-rebase", "--ff-only", "origin", "main"]
         );
         assert_eq!(
             pull_args("origin", &[], true, &MergeOptions::default()).unwrap(),
-            ["pull", "--progress", "--autostash", "--rebase", "origin"]
+            ["pull", "--progress", "--rebase", "origin"]
         );
         assert!(pull_args("origin", &[], true, &MergeOptions { squash: true, ..Default::default() }).is_err());
     }
